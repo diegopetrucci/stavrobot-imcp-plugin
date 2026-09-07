@@ -1,0 +1,16 @@
+{
+  "name": "imcp_call",
+  "description": "Call an iMCP tool through the authenticated bridge.",
+  "entrypoint": "run.py",
+  "async": false,
+  "parameters": {
+    "name": {
+      "type": "string",
+      "description": "The exact iMCP tool name to call."
+    },
+    "arguments": {
+      "type": "object",
+      "description": "Optional JSON object of arguments for the iMCP tool; omitted arguments default to {}."
+    }
+  }
+}

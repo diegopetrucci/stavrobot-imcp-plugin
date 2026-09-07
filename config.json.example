@@ -1,0 +1,4 @@
+{
+  "bridge_url": "http://host.docker.internal:8766/bridge",
+  "bridge_token": "REPLACE_WITH_BRIDGE_TOKEN"
+}

@@ -1,0 +1,7 @@
+{
+  "name": "imcp_list_tools",
+  "description": "List the tools and input schemas exposed by the iMCP bridge.",
+  "entrypoint": "run.py",
+  "async": false,
+  "parameters": {}
+}
