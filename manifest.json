@@ -1,6 +1,7 @@
 {
   "name": "imcp",
-  "description": "Expose iMCP tools through an authenticated bridge.",
+  "summary": "Access calendar, contacts, messages, reminders, weather and maps on macOS",
+  "description": "Bridges to iMCP, exposing macOS-native services to the assistant: Calendar (list calendars, fetch and create events), Contacts (search, create, and update contacts), Messages (fetch message history), Reminders (list, fetch, and create reminders), Location (current position and geocoding), Maps (search places, directions, ETA, nearby points of interest, and static map images), Weather (current conditions, hourly, daily, and minute-by-minute forecasts), Shortcuts (list and run), and Camera, audio recording, and screenshot capture. The tool surface available at runtime is gated twice: by which iMCP services the operator has enabled in the macOS app, and by the host bridge allowlist. Call imcp_list_tools to discover what is actually available in the current deployment.",
   "instructions": "Install the public standalone plugin repository at https://github.com/diegopetrucci/stavrobot-imcp-plugin. Its repository root must contain manifest.json; maintainers publish the contents of plugin/imcp/ at that root, while consumers install the published URL rather than the monorepo subtree. Manually prepare the host bridge, then configure bridge_url and bridge_token through Stavrobot web settings or a trusted host-side secret path; never paste bridge_token into agent chat. The default bridge URL is http://host.docker.internal:8766/bridge. The token is used only for authentication and is never included in tool responses or errors.",
   "config": {
     "bridge_url": {
