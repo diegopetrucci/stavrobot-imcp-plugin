@@ -1,0 +1,6 @@
+# Official MCP Python SDK used by the probe and host bridge.
+mcp==2.1.1
+# Bonjour service discovery for the shared iMCP loopback transport.
+zeroconf==0.151.3
+# Focused bridge and repository test runner.
+pytest==8.4.2

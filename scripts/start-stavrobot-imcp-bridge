@@ -1,0 +1,160 @@
+#!/bin/bash
+set -euo pipefail
+
+# launchd/tmux do not inherit an interactive shell's PATH. Keep the host
+# bridge's executable lookup deterministic, just like the other host bridge.
+export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+
+session="stavrobot-imcp-bridge"
+repo_root="$HOME/Developer/stavrobot-imcp-plugin"
+bridge="$repo_root/bridge/server.py"
+python_bin="$repo_root/.venv/bin/python"
+token_file="$HOME/.config/imcp-bridge.token"
+allowlist_file="$HOME/.config/imcp-bridge-tools.json"
+tmux_bin="/opt/homebrew/bin/tmux"
+lsof_bin="/usr/sbin/lsof"
+stat_bin="/usr/bin/stat"
+bind="127.0.0.1"
+port="8766"
+bridge_path="/bridge"
+call_timeout="10"
+
+if [[ ! -x "$tmux_bin" ]]; then
+  echo "tmux is unavailable" >&2
+  exit 1
+fi
+
+if [[ ! -x "$lsof_bin" ]]; then
+  echo "lsof is unavailable" >&2
+  exit 1
+fi
+
+if [[ ! -x "$stat_bin" ]]; then
+  echo "stat is unavailable" >&2
+  exit 1
+fi
+
+if [[ ! -x "$python_bin" ]]; then
+  echo "the repository venv Python is unavailable" >&2
+  echo "Create the repository venv before starting the bridge." >&2
+  exit 1
+fi
+
+if [[ ! -f "$bridge" ]]; then
+  echo "the iMCP bridge source is unavailable" >&2
+  echo "Check out the bridge source before starting it." >&2
+  exit 1
+fi
+
+owner_readable_file() {
+  local path="$1"
+  local mode
+
+  if [[ ! -f "$path" || ! -r "$path" || ! -s "$path" ]]; then
+    return 1
+  fi
+  if ! mode="$("$stat_bin" -f "%Lp" "$path" 2>/dev/null)"; then
+    return 1
+  fi
+  if [[ ! "$mode" =~ ^[0-7]+$ ]]; then
+    return 1
+  fi
+
+  # The file must be readable by its owner and inaccessible to group/other.
+  # Reject owner-executable files too: 0600 or 0400 are the intended forms.
+  (( (8#$mode & 0077) == 0 && (8#$mode & 0100) == 0 ))
+}
+
+if ! owner_readable_file "$token_file"; then
+  echo "the bridge token file is missing, empty, unreadable, or not private" >&2
+  echo "Configure it with owner-only mode 0600 or stricter outside agent chat." >&2
+  exit 1
+fi
+
+if ! owner_readable_file "$allowlist_file"; then
+  echo "the bridge allowlist file is missing, empty, unreadable, or not private" >&2
+  echo "Create it with explicit selected tool names and owner-only mode 0600 or stricter." >&2
+  exit 1
+fi
+
+port_is_listening() {
+  "$lsof_bin" -nP -iTCP:"$port" -sTCP:LISTEN >/dev/null 2>&1
+}
+
+# A running instance from this helper is deliberately replaced only through
+# the exact reserved tmux session. No process discovery or token inspection is
+# used, and no lsof details are printed because they can contain unrelated
+# command-line information. If the fixed port is occupied without that exact
+# session, treat it as a collision and leave the listener untouched.
+if port_is_listening; then
+  if ! "$tmux_bin" has-session -t "$session" >/dev/null 2>&1; then
+    echo "cannot start iMCP bridge: fixed bridge port $port is already in use" >&2
+    echo "Refusing to stop an unrelated listener; inspect the service and retry." >&2
+    exit 1
+  fi
+  "$tmux_bin" kill-session -t "$session" >/dev/null 2>&1 || true
+elif "$tmux_bin" has-session -t "$session" >/dev/null 2>&1; then
+  # Remove a stale session before creating the one-and-only session. This
+  # makes repeated starts converge on one managed bridge without touching
+  # other tmux sessions or any process that owns the fixed port.
+  "$tmux_bin" kill-session -t "$session" >/dev/null 2>&1 || true
+fi
+
+# Killing a bridge may take a moment to release the socket. Never force
+# another process off the port; fail clearly if it remains occupied.
+release_attempts=0
+while port_is_listening; do
+  if [[ "$release_attempts" -ge 10 ]]; then
+    echo "cannot start iMCP bridge: fixed bridge port $port remains in use" >&2
+    echo "The previous session was stopped, but no other listener was terminated." >&2
+    exit 1
+  fi
+  release_attempts=$((release_attempts + 1))
+  sleep 1
+done
+
+created_session=0
+cleanup_failed_start() {
+  status=$?
+  if [[ "$status" -ne 0 && "$created_session" -eq 1 ]]; then
+    "$tmux_bin" kill-session -t "$session" >/dev/null 2>&1 || true
+  fi
+  exit "$status"
+}
+trap cleanup_failed_start EXIT
+
+# tmux executes a single shell command. printf %q preserves spaces and shell
+# metacharacters in paths without exposing a token value or using eval.
+tmux_command="$(
+  printf '%q ' \
+    "$python_bin" \
+    "$bridge" \
+    --bind "$bind" \
+    --port "$port" \
+    --path "$bridge_path" \
+    --token-file "$token_file" \
+    --allowlist-file "$allowlist_file" \
+    --call-timeout "$call_timeout"
+)"
+tmux_command="${tmux_command% }"
+
+if ! "$tmux_bin" new-session -d -s "$session" -c "$repo_root" "$tmux_command" >/dev/null 2>&1; then
+  echo "could not create the iMCP bridge tmux session" >&2
+  exit 1
+fi
+created_session=1
+
+# Do not report success until the child remains in its session and owns the
+# expected fixed listener. A startup failure is cleaned up by the EXIT trap.
+sleep 1
+if ! "$tmux_bin" has-session -t "$session" >/dev/null 2>&1; then
+  echo "iMCP bridge exited before listening on $bind:$port" >&2
+  exit 1
+fi
+if ! port_is_listening; then
+  echo "iMCP bridge did not start listening on $bind:$port" >&2
+  exit 1
+fi
+
+created_session=0
+echo "started $session on http://$bind:$port$bridge_path"
