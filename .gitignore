@@ -1,5 +1,8 @@
+PLAN.md
+.tickets/
+.venv/
 config.json
-.DS_Store
 __pycache__/
-*.py[cod]
+.DS_Store
 .pytest_cache/
+*.py[cod]
