@@ -10,9 +10,10 @@ import sys
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from bridge.server import load_allowlist, load_token
+from stavrobot_imcp import load_client_credential
 
 
-def preflight(home: Path) -> tuple[Path, Path]:
+def preflight(home: Path) -> tuple[Path, Path, Path | None]:
     token = home / ".config/imcp-bridge.token"
     allowlist = home / ".config/imcp-bridge-tools.json"
     for path in (token, allowlist):
@@ -22,25 +23,33 @@ def preflight(home: Path) -> tuple[Path, Path]:
         if stat.S_IMODE(info.st_mode) not in (0o400, 0o600):
             raise ValueError("configuration must be mode 0400 or 0600")
     load_token(token)
+    credential = home / ".config/imcp-client.credential"
+    if os.path.lexists(credential):
+        load_client_credential(credential)  # validates perms/ownership; value discarded
+    else:
+        credential = None
     load_allowlist(allowlist)
     with socket.socket() as sock:
         # Match HTTPServer's reuse policy: recently closed connections in
         # TIME_WAIT must not look like a live listener after a crash.
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         sock.bind(("127.0.0.1", 8766))
-    return token, allowlist
+    return token, allowlist, credential
 
 
 def main() -> int:
     try:
-        token, allowlist = preflight(Path.home())
+        token, allowlist, credential = preflight(Path.home())
     except Exception:
         print("bridge preflight failed: check private configuration and port 8766; launchd will retry after its throttle interval", file=sys.stderr)
         return 78
-    os.execv(sys.executable, [sys.executable, str(ROOT / "bridge/server.py"),
+    argv = [sys.executable, str(ROOT / "bridge/server.py"),
         "--bind", "127.0.0.1", "--port", "8766", "--path", "/bridge",
         "--token-file", str(token), "--allowlist-file", str(allowlist),
-        "--call-timeout", "10"])
+        "--call-timeout", "10"]
+    if credential is not None:
+        argv += ["--client-credential-file", str(credential)]
+    os.execv(sys.executable, argv)
     return 1
 
 

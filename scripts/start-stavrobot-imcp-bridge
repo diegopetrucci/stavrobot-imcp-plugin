@@ -11,6 +11,7 @@ bridge="$repo_root/bridge/server.py"
 python_bin="$repo_root/.venv/bin/python"
 token_file="$HOME/.config/imcp-bridge.token"
 allowlist_file="$HOME/.config/imcp-bridge-tools.json"
+client_credential_file="$HOME/.config/imcp-client.credential"
 tmux_bin="/opt/homebrew/bin/tmux"
 lsof_bin="/usr/sbin/lsof"
 stat_bin="/usr/bin/stat"
@@ -77,6 +78,18 @@ if ! owner_readable_file "$allowlist_file"; then
   exit 1
 fi
 
+# Optional iMCP 1.8.2+ client credential: used only when the file exists, but
+# an existing file must be private. The value is never read or printed here.
+credential_args=()
+if [[ -e "$client_credential_file" || -L "$client_credential_file" ]]; then
+  if ! owner_readable_file "$client_credential_file"; then
+    echo "the iMCP client credential file is unreadable, empty, or not private" >&2
+    echo "Fix it with owner-only mode 0600 or stricter, or remove it." >&2
+    exit 1
+  fi
+  credential_args=(--client-credential-file "$client_credential_file")
+fi
+
 port_is_listening() {
   "$lsof_bin" -nP -iTCP:"$port" -sTCP:LISTEN >/dev/null 2>&1
 }
@@ -134,7 +147,8 @@ tmux_command="$(
     --path "$bridge_path" \
     --token-file "$token_file" \
     --allowlist-file "$allowlist_file" \
-    --call-timeout "$call_timeout"
+    --call-timeout "$call_timeout" \
+    ${credential_args[@]+"${credential_args[@]}"}
 )"
 tmux_command="${tmux_command% }"
 

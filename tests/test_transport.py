@@ -1,502 +1,308 @@
 from __future__ import annotations
 
 import asyncio
-import json
-import types as stdlib_types
+import os
+import sys
+import tempfile
+import time
 import unittest
+from contextlib import asynccontextmanager
+from pathlib import Path
 from unittest.mock import patch
 
-import anyio
-from mcp.shared.message import SessionMessage
-from mcp import types as mcp_types
+import pytest
+from mcp import MCPError, types
+from mcp.client import stdio as sdk_stdio
 
 from stavrobot_imcp import transport
 
 
-class _FakeReader(asyncio.StreamReader):
-    pass
+def _write_executable(directory: Path, body: str) -> Path:
+    path = directory / "imcp-server"
+    path.write_text(f"#!{sys.executable}\n{body}", encoding="utf-8")
+    path.chmod(0o755)
+    return path
 
 
-class _FakeWriter:
-    def __init__(self) -> None:
-        self.payloads: list[bytes] = []
-        self.closed = False
-        self.wait_closed_called = False
+SERVER_BODY = r'''
+import json
+import pathlib
+import sys
 
-    def is_closing(self) -> bool:
-        return self.closed
+marker = pathlib.Path(__MARKER__)
 
-    def write(self, payload: bytes) -> None:
-        self.payloads.append(payload)
+def send(message):
+    sys.stdout.write(json.dumps(message) + "\n")
+    sys.stdout.flush()
 
-    async def drain(self) -> None:
+try:
+    for line in sys.stdin:
+        request = json.loads(line)
+        method = request.get("method")
+        request_id = request.get("id")
+        if request_id is None:
+            continue
+        if method == "initialize":
+            send({
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "result": {
+                    "protocolVersion": "2025-11-25",
+                    "capabilities": {"tools": {}},
+                    "serverInfo": {"name": "stdio-fixture", "version": "1"},
+                },
+            })
+        elif method == "tools/list":
+            send({
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "result": {"tools": [{"name": "fixture", "inputSchema": {"type": "object"}}]},
+            })
+finally:
+    marker.write_text("closed", encoding="utf-8")
+'''
+
+
+IGNORANT_SERVER_BODY = r'''
+import os
+import pathlib
+import signal
+import time
+
+pid_file = pathlib.Path(__PID_FILE__)
+pid_file.write_text(str(os.getpid()), encoding="utf-8")
+signal.signal(signal.SIGTERM, signal.SIG_IGN)
+while True:
+    time.sleep(0.05)
+'''
+
+
+class _FakeClientSession:
+    def __init__(self, read_stream: object, write_stream: object, **kwargs: object) -> None:
+        self.streams = (read_stream, write_stream)
+        self.kwargs = kwargs
+
+    async def __aenter__(self) -> _FakeClientSession:
+        return self
+
+    async def __aexit__(self, _exc_type: object, _exc_value: object, _traceback: object) -> None:
         return None
-
-    def close(self) -> None:
-        self.closed = True
-
-    async def wait_closed(self) -> None:
-        self.wait_closed_called = True
-
-
-class _FakeBonjour:
-    def __init__(self, infos: dict[str, object | None]) -> None:
-        self.zeroconf = object()
-        self.infos = infos
-        self.requested: list[tuple[str, str, int]] = []
-        self.closed = False
-
-    async def async_get_service_info(self, service_type: str, name: str, *, timeout: int) -> object | None:
-        self.requested.append((service_type, name, timeout))
-        return self.infos.get(name)
-
-    async def async_close(self) -> None:
-        self.closed = True
-
-
-class _FakeBrowser:
-    def __init__(
-        self,
-        _zeroconf: object,
-        service_type: str,
-        *,
-        listener: object,
-        names: tuple[str, ...] = ("iMCP._mcp._tcp.local.",),
-    ) -> None:
-        self.cancelled = False
-        for name in names:
-            listener.add_service(object(), service_type, name)
-
-    async def async_cancel(self) -> None:
-        self.cancelled = True
-
-
-class _ResetReader:
-    async def readline(self) -> bytes:
-        raise ConnectionResetError("peer reset")
 
 
 class TransportTests(unittest.IsolatedAsyncioTestCase):
-    def test_selects_local_service_port_without_using_advertised_addresses(self) -> None:
-        infos = [
-            stdlib_types.SimpleNamespace(
-                name="remote._mcp._tcp.local.",
-                server="another-host.local.",
-                port=4321,
-                addresses=[b"192.0.2.10"],
-            ),
-            stdlib_types.SimpleNamespace(
-                name="iMCP._mcp._tcp.local.",
-                server="My-Mac.local.",
-                port=54321,
-                addresses=[b"192.0.2.20", b"10.0.0.20"],
-            ),
-        ]
-
-        port = transport.select_local_service_port(infos, local_hostnames={"my-mac.local"})
-
-        self.assertEqual(port, 54321)
-
-    def test_absent_local_service_fails_closed(self) -> None:
-        with self.assertRaises(transport.NoLocalServiceError):
-            transport.select_local_service_port(
-                [
-                    stdlib_types.SimpleNamespace(
-                        name="remote._mcp._tcp.local.",
-                        server="other.local.",
-                        port=1234,
-                    )
-                ],
-                local_hostnames={"this-host.local"},
-            )
-
-    def test_ambiguous_local_services_fail_closed(self) -> None:
-        infos = [
-            {"name": "first._mcp._tcp.local.", "server": "this-host.local.", "port": 1111},
-            {"name": "second._mcp._tcp.local.", "server": "this-host.local.", "port": 2222},
-        ]
-
-        with self.assertRaises(transport.AmbiguousLocalServiceError):
-            transport.select_local_service_port(infos, local_hostnames={"this-host.local"})
-
-    def test_invalid_local_service_port_fails_closed(self) -> None:
-        for port in (0, -1, 65536, True):
-            with self.subTest(port=port):
-                with self.assertRaises(transport.InvalidLocalServiceError):
-                    transport.select_local_service_port(
-                        [
-                            {
-                                "name": "iMCP._mcp._tcp.local.",
-                                "server": "this-host.local.",
-                                "port": port,
-                            }
-                        ],
-                        local_hostnames={"this-host.local"},
-                    )
-
-    def test_default_host_aliases_do_not_use_reverse_dns(self) -> None:
-        with patch.object(transport.socket, "gethostname", return_value="this-host"):
-            with patch.object(transport.socket, "getfqdn", side_effect=AssertionError("reverse DNS used")):
-                names = transport._default_local_hostnames()
-
-        self.assertIn("this-host", names)
-        self.assertIn("this-host.local", names)
-
-    async def test_zeroconf_discovery_uses_service_type_and_dynamic_port(self) -> None:
-        info = stdlib_types.SimpleNamespace(
-            name="iMCP._mcp._tcp.local.",
-            server="this-host.local.",
-            port=61234,
-            addresses=[b"198.51.100.7"],
+    def test_shutdown_floor_matches_pinned_sdk_escalation_budget(self) -> None:
+        sdk_budget = (
+            sdk_stdio._WRITER_FLUSH_TIMEOUT
+            + sdk_stdio.PROCESS_TERMINATION_TIMEOUT
+            + sdk_stdio.FORCE_KILL_TIMEOUT
+            + sdk_stdio._KILL_REAP_TIMEOUT
         )
-        fake_zeroconf = _FakeBonjour({"iMCP._mcp._tcp.local.": info})
-        browser_instances: list[_FakeBrowser] = []
+        self.assertAlmostEqual(sdk_budget, 6.5)
+        self.assertAlmostEqual(transport.SDK_SHUTDOWN_BUDGET, sdk_budget)
+        self.assertAlmostEqual(transport.MIN_SHUTDOWN_TIMEOUT, 7.0)
+        self.assertGreaterEqual(transport.MIN_SHUTDOWN_TIMEOUT, sdk_budget)
 
-        def browser_factory(
-            zeroconf: object,
-            service_type: str,
-            *,
-            listener: object,
-        ) -> _FakeBrowser:
-            browser = _FakeBrowser(zeroconf, service_type, listener=listener)
-            browser_instances.append(browser)
-            return browser
-
-        port = await transport.discover_local_service_port(
-            timeout=0.01,
-            close_timeout=0.2,
-            local_hostnames={"this-host.local"},
-            zeroconf_factory=lambda: fake_zeroconf,
-            browser_factory=browser_factory,
-        )
-
-        self.assertEqual(port, 61234)
+    def test_default_command_path_is_the_bundled_executable(self) -> None:
         self.assertEqual(
-            fake_zeroconf.requested[0][0],
-            transport.SERVICE_TYPE,
-        )
-        self.assertTrue(fake_zeroconf.closed)
-        self.assertTrue(browser_instances[0].cancelled)
-
-    async def test_discovery_with_no_observed_services_fails_and_cleans_up(self) -> None:
-        fake_zeroconf = _FakeBonjour({})
-        browser_instances: list[_FakeBrowser] = []
-
-        def browser_factory(
-            zeroconf: object,
-            service_type: str,
-            *,
-            listener: object,
-        ) -> _FakeBrowser:
-            browser = _FakeBrowser(zeroconf, service_type, listener=listener, names=())
-            browser_instances.append(browser)
-            return browser
-
-        with self.assertRaises(transport.NoLocalServiceError):
-            await transport.discover_local_service_port(
-                timeout=0.01,
-                close_timeout=0.2,
-                local_hostnames={"this-host.local"},
-                zeroconf_factory=lambda: fake_zeroconf,
-                browser_factory=browser_factory,
-            )
-
-        self.assertTrue(fake_zeroconf.closed)
-        self.assertTrue(browser_instances[0].cancelled)
-
-    async def test_discovery_with_ambiguous_local_services_fails_and_cleans_up(self) -> None:
-        names = ("first._mcp._tcp.local.", "second._mcp._tcp.local.")
-        fake_zeroconf = _FakeBonjour(
-            {
-                names[0]: stdlib_types.SimpleNamespace(
-                    name=names[0], server="this-host.local.", port=1111
-                ),
-                names[1]: stdlib_types.SimpleNamespace(
-                    name=names[1], server="this-host.local.", port=2222
-                ),
-            }
-        )
-        browser_instances: list[_FakeBrowser] = []
-
-        def browser_factory(
-            zeroconf: object,
-            service_type: str,
-            *,
-            listener: object,
-        ) -> _FakeBrowser:
-            browser = _FakeBrowser(zeroconf, service_type, listener=listener, names=names)
-            browser_instances.append(browser)
-            return browser
-
-        with self.assertRaises(transport.AmbiguousLocalServiceError):
-            await transport.discover_local_service_port(
-                timeout=0.01,
-                close_timeout=0.2,
-                local_hostnames={"this-host.local"},
-                zeroconf_factory=lambda: fake_zeroconf,
-                browser_factory=browser_factory,
-            )
-
-        self.assertTrue(fake_zeroconf.closed)
-        self.assertTrue(browser_instances[0].cancelled)
-
-    async def test_discovery_with_unresolved_service_fails_and_cleans_up(self) -> None:
-        name = "iMCP._mcp._tcp.local."
-        fake_zeroconf = _FakeBonjour({name: None})
-        browser_instances: list[_FakeBrowser] = []
-
-        def browser_factory(
-            zeroconf: object,
-            service_type: str,
-            *,
-            listener: object,
-        ) -> _FakeBrowser:
-            browser = _FakeBrowser(zeroconf, service_type, listener=listener, names=(name,))
-            browser_instances.append(browser)
-            return browser
-
-        with self.assertRaises(transport.DiscoveryError):
-            await transport.discover_local_service_port(
-                timeout=0.01,
-                close_timeout=0.2,
-                local_hostnames={"this-host.local"},
-                zeroconf_factory=lambda: fake_zeroconf,
-                browser_factory=browser_factory,
-            )
-
-        self.assertTrue(fake_zeroconf.closed)
-        self.assertTrue(browser_instances[0].cancelled)
-
-    async def test_discovery_resolution_deadline_fails_and_cleans_up(self) -> None:
-        name = "iMCP._mcp._tcp.local."
-
-        class _SlowBonjour(_FakeBonjour):
-            async def async_get_service_info(
-                self,
-                service_type: str,
-                service_name: str,
-                *,
-                timeout: int,
-            ) -> object | None:
-                await asyncio.sleep(0.2)
-                return await super().async_get_service_info(
-                    service_type,
-                    service_name,
-                    timeout=timeout,
-                )
-
-        fake_zeroconf = _SlowBonjour(
-            {
-                name: stdlib_types.SimpleNamespace(
-                    name=name,
-                    server="this-host.local.",
-                    port=61234,
-                )
-            }
-        )
-        browser_instances: list[_FakeBrowser] = []
-
-        def browser_factory(
-            zeroconf: object,
-            service_type: str,
-            *,
-            listener: object,
-        ) -> _FakeBrowser:
-            browser = _FakeBrowser(zeroconf, service_type, listener=listener, names=(name,))
-            browser_instances.append(browser)
-            return browser
-
-        with self.assertRaises(transport.DiscoveryError):
-            await transport.discover_local_service_port(
-                timeout=0.01,
-                close_timeout=0.2,
-                local_hostnames={"this-host.local"},
-                zeroconf_factory=lambda: fake_zeroconf,
-                browser_factory=browser_factory,
-            )
-
-        self.assertTrue(fake_zeroconf.closed)
-        self.assertTrue(browser_instances[0].cancelled)
-
-    async def test_connection_forces_loopback_and_keeps_dynamic_port(self) -> None:
-        reader = _FakeReader()
-        writer = _FakeWriter()
-        observed: list[tuple[tuple[object, ...], dict[str, object]]] = []
-
-        async def fake_open_connection(
-            *args: object,
-            **kwargs: object,
-        ) -> tuple[asyncio.StreamReader, asyncio.StreamWriter]:
-            observed.append((args, kwargs))
-            return reader, writer  # type: ignore[return-value]
-
-        with patch.object(transport.asyncio, "open_connection", fake_open_connection):
-            result = await transport.open_loopback_connection(61234, timeout=0.2)
-
-        self.assertIs(result[0], reader)
-        self.assertIs(result[1], writer)
-        self.assertEqual(
-            observed,
-            [(("127.0.0.1", 61234), {"limit": transport.MAX_MESSAGE_BYTES})],
+            transport.DEFAULT_SERVER_PATH,
+            Path("/Applications/iMCP.app/Contents/MacOS/imcp-server"),
         )
 
-    async def test_large_jsonrpc_frame_over_64k_is_preserved(self) -> None:
-        reader = asyncio.StreamReader(limit=transport.MAX_MESSAGE_BYTES)
-        payload = {"jsonrpc": "2.0", "id": 8, "result": {"text": "x" * 70_000}}
-        reader.feed_data((json.dumps(payload) + "\n").encode("utf-8"))
+    def test_path_validation_rejects_relative_directory_and_non_executable(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with self.assertRaises(transport.TransportConfigurationError):
+                transport._validate_server_path(Path("imcp-server"))
+            with self.assertRaises(transport.TransportConfigurationError):
+                transport._validate_server_path(root)
 
-        incoming = await transport._TCPReadStream(reader).receive()
+            non_executable = root / "not-executable"
+            non_executable.write_text("#!/bin/sh\n", encoding="utf-8")
+            non_executable.chmod(0o600)
+            with self.assertRaises(PermissionError):
+                transport._validate_server_path(non_executable)
 
-        self.assertIsInstance(incoming, SessionMessage)
-        assert isinstance(incoming, SessionMessage)
-        self.assertEqual(len(incoming.message.result["text"]), 70_000)  # type: ignore[attr-defined]
+    def test_missing_command_fails_before_sdk_launch(self) -> None:
+        missing = Path(tempfile.gettempdir()) / "imcp-server-does-not-exist-for-test"
+        with self.assertRaises(FileNotFoundError):
+            transport._server_parameters(missing)
 
-    async def test_over_limit_jsonrpc_frame_is_a_closed_broken_transport(self) -> None:
-        reader = asyncio.StreamReader(limit=transport.MAX_MESSAGE_BYTES)
-        reader.feed_data(
-            b'{"jsonrpc":"2.0","id":9,"result":{"text":"'
-            + (b"x" * transport.MAX_MESSAGE_BYTES)
-            + b'"}}\n'
-        )
-        read_stream = transport._TCPReadStream(reader)
+    async def test_short_shutdown_timeout_is_rejected_before_launch(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = _write_executable(Path(directory), "")
+            with self.assertRaisesRegex(transport.TransportConfigurationError, "at least"):
+                async with transport.open_imcp_session(server_path=path, shutdown_timeout=0.25):
+                    pass
 
-        with self.assertRaises(transport.FrameTooLargeError) as raised:
-            await read_stream.receive()
+    async def test_command_construction_uses_official_sdk_parameters(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = _write_executable(Path(directory), "")
+            captured: list[object] = []
+            captured_errlogs: list[object] = []
 
-        self.assertIsInstance(raised.exception, anyio.BrokenResourceError)
-        with self.assertRaises(anyio.ClosedResourceError):
-            await read_stream.receive()
+            @asynccontextmanager
+            async def fake_stdio(server: object, *, errlog: object) -> object:
+                captured.append(server)
+                captured_errlogs.append(errlog)
+                yield (object(), object())
 
-    async def test_reset_read_is_clean_async_stream_termination(self) -> None:
-        read_stream = transport._TCPReadStream(_ResetReader())  # type: ignore[arg-type]
+            client_info = types.Implementation(name="transport-test", version="1")
+            with (
+                patch.object(transport, "stdio_client", fake_stdio),
+                patch.object(transport, "ClientSession", _FakeClientSession),
+            ):
+                async with transport.open_imcp_session(
+                    server_path=path,
+                    client_info=client_info,
+                    read_timeout_seconds=0.2,
+                    startup_timeout=0.2,
+                ) as session:
+                    self.assertIsInstance(session, _FakeClientSession)
 
-        self.assertEqual([item async for item in read_stream], [])
-        with self.assertRaises(anyio.ClosedResourceError):
-            await read_stream.receive()
+            self.assertEqual(len(captured), 1)
+            self.assertEqual(len(captured_errlogs), 1)
+            self.assertEqual(getattr(captured_errlogs[0], "name", None), os.devnull)
+            self.assertTrue(getattr(captured_errlogs[0], "closed", False))
+            parameters = captured[0]
+            assert isinstance(parameters, transport.StdioServerParameters)
+            self.assertEqual(parameters.command, str(path))
+            self.assertEqual(parameters.args, [])
+            self.assertEqual(parameters.env, None)
+            self.assertEqual(session.kwargs["client_info"], client_info)
+            self.assertEqual(session.kwargs["read_timeout_seconds"], 0.2)
 
-    async def test_newline_jsonrpc_framing_uses_sdk_messages(self) -> None:
-        reader = _FakeReader()
-        writer = _FakeWriter()
-        reader.feed_data(b'{"jsonrpc":"2.0","id":7,"result":{"ok":true}}\n')
+    async def test_startup_timeout_is_bounded(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = _write_executable(Path(directory), "")
 
-        read_stream = transport._TCPReadStream(reader)
-        write_stream = transport._TCPWriteStream(writer)
-        incoming = await read_stream.receive()
-        await write_stream.send(
-            SessionMessage(
-                mcp_types.JSONRPCNotification(
-                    jsonrpc="2.0",
-                    method="notifications/initialized",
-                )
-            )
-        )
+            @asynccontextmanager
+            async def slow_stdio(_server: object, *, errlog: object) -> object:
+                await asyncio.sleep(1)
+                yield (object(), object())
 
-        self.assertIsInstance(incoming, SessionMessage)
-        assert isinstance(incoming, SessionMessage)
-        self.assertEqual(incoming.message.id, 7)  # type: ignore[attr-defined]
-        self.assertEqual(
-            json.loads(writer.payloads[0]),
-            {"jsonrpc": "2.0", "method": "notifications/initialized"},
-        )
+            started = time.monotonic()
+            with (
+                patch.object(transport, "stdio_client", slow_stdio),
+                self.assertRaisesRegex(TimeoutError, "stdio startup"),
+            ):
+                async with transport.open_imcp_session(
+                    server_path=path,
+                    startup_timeout=0.02,
+                ):
+                    pass
+            self.assertLess(time.monotonic() - started, 0.5)
 
-    async def test_bounded_await_cancellation_does_not_hang(self) -> None:
-        release = asyncio.Event()
+    async def test_real_sdk_stdio_lifecycle_initializes_and_lists_tools(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            marker = root / "closed"
+            body = SERVER_BODY.replace("__MARKER__", repr(str(marker)))
+            path = _write_executable(root, body)
+            client_info = types.Implementation(name="transport-test", version="1")
 
-        async def stubborn_cleanup() -> None:
-            try:
-                await asyncio.Event().wait()
-            except asyncio.CancelledError:
-                await release.wait()
-
-        cleanup = asyncio.create_task(transport._bounded_await(stubborn_cleanup(), 0.03))
-        await asyncio.sleep(0.005)
-        started = asyncio.get_running_loop().time()
-        cleanup.cancel()
-        with self.assertRaises(asyncio.CancelledError):
-            await asyncio.wait_for(cleanup, 0.2)
-        elapsed = asyncio.get_running_loop().time() - started
-        self.assertLess(elapsed, 0.2)
-        release.set()
-        await asyncio.sleep(0)
-
-    async def test_transport_shutdown_closes_tcp_writer_and_streams(self) -> None:
-        reader = _FakeReader()
-        writer = _FakeWriter()
-
-        async def fake_open_connection(
-            *_args: object,
-            **_kwargs: object,
-        ) -> tuple[asyncio.StreamReader, asyncio.StreamWriter]:
-            return reader, writer  # type: ignore[return-value]
-
-        async def fake_discovery() -> int:
-            return 61235
-
-        with patch.object(transport.asyncio, "open_connection", fake_open_connection):
-            async with transport.loopback_transport(
-                discovery=fake_discovery,
-                close_timeout=0.2,
-            ) as (_read_stream, write_stream):
-                await write_stream.send(
-                    SessionMessage(
-                        mcp_types.JSONRPCNotification(
-                            jsonrpc="2.0",
-                            method="notifications/initialized",
-                        )
-                    )
-                )
-
-        self.assertTrue(writer.closed)
-        self.assertTrue(writer.wait_closed_called)
-        with self.assertRaises(anyio.ClosedResourceError):
-            await write_stream.send(
-                SessionMessage(
-                    mcp_types.JSONRPCNotification(
-                        jsonrpc="2.0",
-                        method="notifications/initialized",
-                    )
-                )
-            )
-
-    async def test_official_client_session_uses_adapted_streams(self) -> None:
-        async def fake_mcp_server(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
-            try:
-                request = json.loads(await reader.readline())
-                response = {
-                    "jsonrpc": "2.0",
-                    "id": request["id"],
-                    "result": {
-                        "protocolVersion": "2025-11-25",
-                        "capabilities": {},
-                        "serverInfo": {"name": "fake", "version": "1"},
-                    },
-                }
-                writer.write((json.dumps(response) + "\n").encode("utf-8"))
-                await writer.drain()
-                await reader.readline()  # notifications/initialized
-            finally:
-                writer.close()
-                await writer.wait_closed()
-
-        server = await asyncio.start_server(fake_mcp_server, "127.0.0.1", 0)
-        assert server.sockets
-        port = server.sockets[0].getsockname()[1]
-
-        async def fake_discovery() -> int:
-            return port
-
-        try:
             async with transport.open_imcp_session(
-                discovery=fake_discovery,
-                connect_timeout=0.2,
-                close_timeout=0.2,
+                server_path=path,
+                client_info=client_info,
+                read_timeout_seconds=1.0,
+                startup_timeout=1.0,
             ) as session:
-                result = await session.initialize()
-                self.assertEqual(result.server_info.name, "fake")
-        finally:
-            server.close()
-            await server.wait_closed()
+                initialized = await session.initialize()
+                tools = await session.list_tools()
+
+            self.assertEqual(initialized.server_info.name, "stdio-fixture")
+            self.assertEqual([tool.name for tool in tools.tools], ["fixture"])
+            self.assertTrue(marker.exists())
+
+    async def test_default_shutdown_kills_process_ignoring_stdin_eof(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            pid_file = root / "pid"
+            body = IGNORANT_SERVER_BODY.replace("__PID_FILE__", repr(str(pid_file)))
+            path = _write_executable(root, body)
+
+            async with transport.open_imcp_session(server_path=path):
+                for _ in range(100):
+                    if pid_file.exists():
+                        break
+                    await asyncio.sleep(0.01)
+                self.assertTrue(pid_file.exists())
+            pid = int(pid_file.read_text(encoding="utf-8"))
+
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                still_running = False
+            except PermissionError:
+                still_running = True
+            else:
+                still_running = True
+            self.assertFalse(still_running)
+
+    async def test_read_timeout_is_enforced_by_official_client(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            body = r'''
+import sys
+for line in sys.stdin:
+    # Deliberately keep initialize unanswered so ClientSession's read bound fires.
+    if line:
+        sys.stdout.flush()
+'''
+            path = _write_executable(Path(directory), body)
+
+            async with transport.open_imcp_session(
+                server_path=path,
+                read_timeout_seconds=0.02,
+                startup_timeout=0.5,
+            ) as session:
+                with pytest.raises(MCPError) as raised:
+                    await session.initialize()
+                self.assertEqual(raised.value.code, types.REQUEST_TIMEOUT)
 
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ClientCredentialTests(unittest.TestCase):
+    SECRET = "s3cret-credential-value"
+
+    def _file(self, directory: str, mode: int, contents: str | None = None) -> Path:
+        path = Path(directory) / "cred"
+        path.write_text(self.SECRET + "\n" if contents is None else contents, encoding="utf-8")
+        path.chmod(mode)
+        return path
+
+    def test_env_only_when_configured(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = _write_executable(Path(directory), "")
+            self.assertIsNone(transport._server_parameters(path).env)
+            env = transport._server_parameters(path, self.SECRET).env
+            assert env is not None
+            self.assertEqual(env["IMCP_CLIENT_CREDENTIAL"], self.SECRET)
+            for key, value in transport.get_default_environment().items():
+                self.assertEqual(env[key], value)
+
+    def test_loader_accepts_private_file(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = self._file(directory, 0o600)
+            self.assertEqual(transport.load_client_credential(path), self.SECRET)
+            path.chmod(0o400)
+            self.assertEqual(transport.load_client_credential(path), self.SECRET)
+
+    def test_loader_rejects_bad_files_without_leaking(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            cases = [
+                self._file(directory, 0o644),
+                self._file(directory, 0o660),
+                self._file(directory, 0o600, "   \n"),
+                self._file(directory, 0o600, f"{self.SECRET} extra"),
+                Path(directory) / "missing",
+            ]
+            for path in cases:
+                with self.assertRaises(transport.TransportConfigurationError) as caught:
+                    transport.load_client_credential(path)
+                self.assertNotIn(self.SECRET, str(caught.exception))
+            link = Path(directory) / "link"
+            link.symlink_to(self._file(directory, 0o600))
+            with self.assertRaises(transport.TransportConfigurationError):
+                transport.load_client_credential(link)

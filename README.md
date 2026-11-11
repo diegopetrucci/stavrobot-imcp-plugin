@@ -1,11 +1,35 @@
 # iMCP bridge plugin for Stavrobot
 
 Connects Stavrobot to [iMCP](https://github.com/mattt/iMCP), exposing approved
-macOS-native services — Calendar, Contacts, Messages, Reminders, Location,
-Maps, Weather, Shortcuts, and camera/audio/screenshot capture — through a
-host-side authenticated bridge. Install it when a Stavrobot agent needs to
+macOS-native services through a host-side authenticated bridge. Install it when a Stavrobot agent needs to
 discover and use those native tools without putting personal-data access in a
 group agent.
+
+## Services
+
+When enabled in iMCP (1.8.2+) and allowlisted on the bridge:
+
+- Calendar (including `events_update`), Contacts, Reminders (update/delete,
+  list create/rename/delete, recurrence)
+- Messages (attachments, `chatId`, `messages_attachment_read`), Phone calls,
+  Voicemail
+- Mail (read-only search/read plus `mail_compose` draft), Notes, Voice Memos
+- Music, Home (HomeKit; requires the self-signed iMCP Helper)
+- Location, Maps, Weather, Shortcuts, Capture (camera, audio, screenshot),
+  Utilities
+
+Mail, Notes, Voice Memos, Voicemail, and Messages attachments need folder
+access granted in iMCP. The bridge caps responses at 256 KiB with a 10 s call
+timeout, so large binary results (audio, attachments, captures) may be
+truncated or fail; text and transcripts work.
+
+## Prerequisites
+
+- A Mac running iMCP **1.8.2 or newer**, with the bundled
+  `Contents/MacOS/imcp-server` executable and the services you want enabled.
+- The host bridge, a bridge token, and a tool allowlist prepared by the
+  operator (see [`DEPLOY.md`](DEPLOY.md)). The bridge uses the bundled stdio
+  server; the plugin only uses the authenticated HTTP contract.
 
 ## Install
 
@@ -62,11 +86,13 @@ start a bridge, connect to live iMCP, or verify a Stavrobot deployment.
 
 [`diegopetrucci/stavrobot-imcp`](https://github.com/diegopetrucci/stavrobot-imcp)
 is the read-only predecessor retained as migration and rollback provenance.
-The imported predecessor revision is the `chore/imcp-1.6-catch-up` branch from
-[PR #4](https://github.com/diegopetrucci/stavrobot-imcp/pull/4), at
-`6cff19f7b1d1f5bdd791892f476b79bf1cadff4b`. The predecessor `main` branch is
-behind that revision by one commit and is not the source of the imported iMCP
-1.6 catch-up. The predecessor is not an active publishing source and has not
+The original import was the predecessor branch `chore/imcp-1.6-catch-up`
+([PR #4](https://github.com/diegopetrucci/stavrobot-imcp/pull/4)) at
+`6cff19f7b1d1f5bdd791892f476b79bf1cadff4b`; at that time predecessor `main`
+was one commit behind it. Later, predecessor `main` through `c208488` (PRs
+[#5](https://github.com/diegopetrucci/stavrobot-imcp/pull/5) stdio transport
+and [#6](https://github.com/diegopetrucci/stavrobot-imcp/pull/6) iMCP 1.8.2
+credential/1.8.3 services) was ported here. The predecessor is not an active publishing source and has not
 been archived by this change; archive it only after consumers, deployment
 configuration, and rollback checks have migrated to this repository. If
 rollback is needed before then, keep it read-only and restore the last
@@ -78,27 +104,26 @@ do not resume publishing from the predecessor.
 The integration has separate host, plugin, and operator boundaries:
 
 ```text
-iMCP app (macOS permissions and manual client approval)
-  -> Bonjour discovery and forced-loopback MCP transport
+iMCP app (>=1.8.2; macOS permissions and manual client approval)
+  -> bundled Contents/MacOS/imcp-server over stdio
   -> bridge/server.py at 127.0.0.1:8766/bridge (authenticated host bridge)
   -> host.docker.internal:8766/bridge (plugin-runner route)
   -> repository-root plugin contract (Stavrobot plugin bundle)
   -> Stavrobot plugin tools and the approved agent
 ```
 
-- `bridge/server.py` owns the authenticated HTTP boundary and keeps the
-  discovered iMCP connection on loopback. See [`bridge/README.md`](bridge/README.md)
-  for its request and response contract.
+- `bridge/server.py` owns the authenticated HTTP boundary and launches the
+  bundled `imcp-server` through the official MCP SDK stdio client. The bridge
+  HTTP request/response contract is unchanged; see
+  [`bridge/README.md`](bridge/README.md) for its contract and lifecycle.
+- The bundled stdio entrypoint is supported only by iMCP **1.8.2 or newer**.
+  Do not substitute network discovery or a manually selected TCP port.
 - The plugin tools are `imcp_list_tools` and `imcp_call`. Host-only source is
   co-located under `bridge/`, `stavrobot_imcp/`, and `scripts/`; it is not part
   of the plugin tool contract. See [`MAINTAINING.md`](MAINTAINING.md).
 - The bridge token, host allowlist, and installed plugin configuration are
   separate operator-managed configuration. Keep credentials out of this
-  repository, agent chat, command output, and logs. If the live host allowlist
-  contains `*`, a future iMCP release can add newly exposed tools without any
-  allowlist edit; review release notes and a fresh read-only `tools/list` result
-  before relying on that expanded surface. This documentation does not change
-  the live allowlist.
+  repository, agent chat, command output, and logs.
 
 ## Python 3.14 setup and local verification
 
@@ -186,8 +211,10 @@ The helper requires the protected token at `~/.config/imcp-bridge.token` and a
 non-empty, owner-only allowlist at `~/.config/imcp-bridge-tools.json`. It passes
 both paths with `--token-file` and `--allowlist-file`, and starts the bridge on
 `127.0.0.1:8766/bridge` with the required `--call-timeout 10` setting. It accepts
-JSON `POST` operations for `health`, `list_tools`, and `call_tool`. This command
-is documentation only;
+JSON `POST` operations for `health`, `list_tools`, and `call_tool`; this plugin
+HTTP contract is unchanged by the stdio migration. If the optional private
+`~/.config/imcp-client.credential` file exists, it also passes
+`--client-credential-file` (see DEPLOY.md). This command is documentation only;
 it was not run as part of authoring this README, and repository setup and tests
 do not start a persistent bridge.
 
@@ -202,20 +229,21 @@ the logged-in macOS session:
 ./.venv/bin/python scripts/probe_imcp.py --timeout 300
 ```
 
-When iMCP shows its Connection Request window, approve the client manually.
-The probe performs the MCP handshake and requests only `tools/list`; it never
-invokes an MCP tool. It uses the shared Bonjour-discovered loopback transport
-and writes only tool names, descriptions, and input schemas to
-`docs/imcp-tools.md`. By default, the recorded app version is read from the
-selected app's `Contents/Info.plist` `CFBundleShortVersionString`. Use
-`--app-version VERSION` to explicitly override it. Without an override,
-missing or invalid version metadata causes the probe to fail rather than
-record a guessed version. Before connecting, the probe compares the running
-iMCP process's canonical executable path and device/inode identity with the
-selected app, and checks the same PID and identity again after `tools/list`.
-After a Sparkle update or rollback, manually quit and relaunch iMCP before
-capture; the probe refuses a different or stale process and never terminates
-or relaunches one automatically.
+The probe launches the bundled `imcp-server` over stdio and identifies itself
+as `imcp-tools-probe`. iMCP may show a **Connection Request** window on the
+first connection; review and approve that client manually. The probe performs
+the MCP handshake and requests only `tools/list`; it never invokes an MCP tool,
+never retries automatically, and writes only tool names, descriptions, and
+input schemas to `docs/imcp-tools.md`. Its outer `--timeout 300` bound covers
+the read-only handshake and listing.
+
+## Transport rollback
+
+If the stdio migration cannot be deployed, stop the active bridge supervisor
+and deploy the last known-good repository revision as a complete unit, with its
+matching requirements; do not mix old transport files with this revision's
+dependencies. The full procedure is in
+[`DEPLOY.md`](DEPLOY.md#stdio-transport-migration-and-rollback).
 
 ## Remove the local environment
 

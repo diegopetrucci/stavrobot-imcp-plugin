@@ -17,12 +17,13 @@ layout or publish a host-bridge-only checkout. Keep the root manifest and the
 root plugin directories in place when changing the co-located host source.
 
 `https://github.com/diegopetrucci/stavrobot-imcp` is the read-only predecessor
-for the migration. The imported predecessor revision is the
-`chore/imcp-1.6-catch-up` branch from
-[PR #4](https://github.com/diegopetrucci/stavrobot-imcp/pull/4), at
-`6cff19f7b1d1f5bdd791892f476b79bf1cadff4b`. The predecessor `main` branch is
-behind that branch by one commit and is not the source of the imported iMCP 1.6
-catch-up. Keep this branch/SHA as exact provenance; do not silently substitute
+for the migration. The original import was the predecessor branch
+`chore/imcp-1.6-catch-up`
+([PR #4](https://github.com/diegopetrucci/stavrobot-imcp/pull/4)) at
+`6cff19f7b1d1f5bdd791892f476b79bf1cadff4b`; at that time predecessor `main`
+was one commit behind it. Later, predecessor `main` through `c208488` (PRs #5
+stdio transport and #6 iMCP 1.8.2 credential/1.8.3 services) was ported here.
+Keep this branch/SHA as exact provenance; do not silently substitute
 predecessor `main` when reviewing or restoring the migration.
 
 The predecessor remains available as a rollback reference, is not an active
@@ -37,6 +38,31 @@ existing-deployment reconciliation required before archival is documented in
 The live `config.json` is installation configuration and is ignored by git.
 Never copy it, credentials, caches, or other local configuration into source
 control.
+
+## Host transport compatibility
+
+The host bridge requires iMCP **1.8.2 or newer** and launches the app's bundled
+`Contents/MacOS/imcp-server` through the official MCP SDK stdio client. The
+plugin runner never launches that process and does not speak stdio; it
+continues to use the authenticated HTTP `POST` contract at `bridge_url` with its
+Bearer token, JSON operation names, response envelope, and `truncated`
+behavior. Transport changes must not change that plugin-facing contract.
+
+The first bridge-side session may cause iMCP to show a **Connection Request**
+for `stavrobot-imcp-bridge`; an operator must review and approve it manually.
+The bridge keeps a session after first use, pings it before each request, and
+relaunches a fresh stdio child if it exited. It never replays a `call_tool`
+whose dispatch or result is uncertain; such a failure is returned as
+`unknown_outcome`. Only a read-only `list_tools` request may be retried after
+approval or startup recovery. The timeout ladder remains 15 seconds for the
+bridge, 20 seconds for this HTTP client, and 30 seconds for the synchronous
+plugin-runner. The bridge's `--call-timeout` is 10 seconds by default and must
+stay strictly below 11 seconds (`call timeout + shutdown timeout < 18s`, with a
+7-second minimum stdio teardown floor).
+
+Rollback to the prior custom TCP transport means deploying a prior repository
+revision as a complete unit; see
+[`DEPLOY.md`](DEPLOY.md#stdio-transport-migration-and-rollback).
 
 ## Runner compatibility notes
 

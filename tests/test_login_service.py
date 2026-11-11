@@ -26,8 +26,27 @@ def config(home):
 def test_preflight_accepts_private_valid_files(tmp_path):
     config(tmp_path)
     with patch("scripts.run_launchd_bridge.socket.socket") as socket:
-        assert len(preflight(tmp_path)) == 2
+        assert preflight(tmp_path)[2] is None
         socket.return_value.__enter__.return_value.setsockopt.assert_called_once()
+
+
+def test_preflight_includes_private_client_credential(tmp_path):
+    directory = config(tmp_path)
+    credential = directory / "imcp-client.credential"
+    credential.write_text("fixture-credential")
+    credential.chmod(0o600)
+    with patch("scripts.run_launchd_bridge.socket.socket"):
+        assert preflight(tmp_path)[2] == credential
+
+
+def test_preflight_rejects_public_client_credential_without_leaking(tmp_path):
+    directory = config(tmp_path)
+    credential = directory / "imcp-client.credential"
+    credential.write_text("fixture-credential")
+    credential.chmod(0o644)
+    with pytest.raises(ValueError) as caught:
+        preflight(tmp_path)
+    assert "fixture-credential" not in str(caught.value)
 
 
 def test_preflight_rejects_public_token(tmp_path):
