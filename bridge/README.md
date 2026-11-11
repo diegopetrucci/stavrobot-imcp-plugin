@@ -1,8 +1,12 @@
 # iMCP host bridge
 
-`server.py` is a macOS-host HTTP boundary around the shared Bonjour/loopback
-transport and the official Python MCP SDK. It is not installed, launched, or
-registered as a persistent service by this repository.
+`server.py` is a macOS-host HTTP boundary around the bundled
+`/Applications/iMCP.app/Contents/MacOS/imcp-server` stdio transport and the
+official Python MCP SDK. It requires iMCP **1.8.2 or newer** and is not
+installed, launched, or registered as a persistent service by this repository.
+The plugin-facing HTTP contract remains independent of this host transport.
+
+Optional `--client-credential-file` (default helper path `~/.config/imcp-client.credential`, mode 0400/0600) supplies the client credential iMCP 1.8.2+ shows after you approve the client with "Always trust this client". The bridge pings a reused session before each request and relaunches `imcp-server` if it exited; it never replays a call.
 
 ## Reproducible setup
 
@@ -75,24 +79,31 @@ Request bodies are limited to 64 KiB and responses to 256 KiB. Oversized
 responses are valid JSON with `truncated: true`; they are structurally pruned
 while retaining result semantics such as `isError` and the structured
 `structuredContent` key when present, never cut at an arbitrary byte boundary.
-MCP operations use a bounded server call timeout (10 seconds by default).
-A cold session setup has a separate 9-second default bound: one 3-second
-Bonjour observation window, up to a second 3-second service-detail resolution
-window, and a 3-second TCP connect. The HTTP bridge gives the complete
-operation—including cold setup, MCP initialization, and tool dispatch—a
-15-second default runtime deadline (the configured call timeout plus 5
-seconds), comfortably before the downstream synchronous plugin's current
-20-second limit. Each phase is also capped by the remaining outer deadline.
+The bridge launches a fresh bundled `imcp-server` child for each new MCP
+session without a shell. Stdio startup has a 5-second default bound; MCP
+initialization and tool operations use the configured 10-second default read
+bound. The HTTP bridge gives the complete operation—including stdio startup,
+MCP initialization, and tool dispatch—a 15-second default runtime deadline
+(the configured call timeout plus 5 seconds), comfortably before the plugin
+client's 20-second limit and the synchronous plugin-runner's 30-second limit.
+Each phase is capped by the remaining outer deadline. Stdio shutdown uses the
+SDK's bounded 6.5-second escalation sequence; the bridge's 7-second shutdown
+floor and 18-second runtime-close budget leave room for orderly teardown. This
+invariant imposes a strict `<11s` ceiling on `--call-timeout`
+(`call timeout + shutdown timeout < 18s`); the default remains 10 seconds.
 
-The MCP session is persistent after first use and reconnects lazily. Each
-reconnect creates a new shared-transport context, causing fresh Bonjour port
-discovery; advertised interface addresses are discarded and the TCP connection
-is made only to `127.0.0.1:<discovered-port>`. If a session is already known
-dead before dispatch, the next request may reconnect. If a `tools/call` may
-have been dispatched and then loses its response, the bridge returns
+The MCP session is persistent after first use and reconnects lazily. A
+reconnect starts a new `imcp-server` process and MCP context; it does not reuse
+or rediscover a TCP endpoint. If iMCP displays a **Connection Request** for the
+bridge client `stavrobot-imcp-bridge`, review and approve it manually. A
+remembered approval may make later launches prompt-free, but a missing prompt
+is not proof that the app is ready. If a session is already known dead before
+dispatch, the next request may reconnect. If a `tools/call` may have been
+dispatched and then loses its response, the bridge returns
 `error.code: "unknown_outcome"`, marks the session dead, and never replays the
-call. A later request can establish a fresh session.
+call. A later request can establish a fresh session; retry only a read-only
+listing after resolving an approval or startup timeout.
 
 The CLI configures INFO operational logging. Logs contain only a bounded tool
-name, status, and duration. Arguments, results, tokens, and discovered host
-details are not logged.
+name, status, and duration. Arguments, results, tokens, and child-process
+output are not logged.

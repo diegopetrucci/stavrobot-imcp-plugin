@@ -18,6 +18,7 @@ import inspect
 import json
 import logging
 import math
+import signal
 import threading
 import time
 from collections.abc import Iterable, Mapping
@@ -29,17 +30,34 @@ from pathlib import Path
 from typing import Any, Callable, TypeAlias
 from urllib.parse import urlsplit
 
+import anyio
 from mcp import MCPError, types
 
 # Keep direct execution (``python bridge/server.py``) working without installing
 # the repository as a package.
 try:
-    from stavrobot_imcp import open_imcp_session
+    from stavrobot_imcp import (
+        DEFAULT_SERVER_PATH,
+        DEFAULT_SHUTDOWN_TIMEOUT as DEFAULT_STDIO_SHUTDOWN_TIMEOUT,
+        DEFAULT_STARTUP_TIMEOUT,
+        MIN_SHUTDOWN_TIMEOUT,
+        TransportConfigurationError,
+        load_client_credential,
+        open_imcp_session,
+    )
 except ModuleNotFoundError:  # pragma: no cover - only used for direct execution
     import sys
 
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-    from stavrobot_imcp import open_imcp_session
+    from stavrobot_imcp import (
+        DEFAULT_SERVER_PATH,
+        DEFAULT_SHUTDOWN_TIMEOUT as DEFAULT_STDIO_SHUTDOWN_TIMEOUT,
+        DEFAULT_STARTUP_TIMEOUT,
+        MIN_SHUTDOWN_TIMEOUT,
+        TransportConfigurationError,
+        load_client_credential,
+        open_imcp_session,
+    )
 
 
 LOGGER = logging.getLogger("imcp.bridge")
@@ -95,12 +113,21 @@ DEFAULT_PATH = "/bridge"
 # the default bridge deadline comfortably below it so timeout responses can be
 # returned before the plugin has to synthesize its own failure.
 DEFAULT_CALL_TIMEOUT = 10.0
-DEFAULT_DISCOVERY_TIMEOUT = 3.0
-DEFAULT_CONNECT_TIMEOUT = 3.0
-DEFAULT_SETUP_TIMEOUT = DEFAULT_DISCOVERY_TIMEOUT * 2 + DEFAULT_CONNECT_TIMEOUT
+DEFAULT_SETUP_TIMEOUT = DEFAULT_STARTUP_TIMEOUT
 DEFAULT_RUNTIME_HEADROOM = 5.0
 DEFAULT_RUNTIME_TIMEOUT = DEFAULT_CALL_TIMEOUT + DEFAULT_RUNTIME_HEADROOM
-DEFAULT_CLOSE_TIMEOUT = 2.0
+# The stdio transport rejects values below its complete escalation budget. The
+# owner gets an additional full-context margin and never cancels its task.
+DEFAULT_SHUTDOWN_TIMEOUT = DEFAULT_STDIO_SHUTDOWN_TIMEOUT
+DEFAULT_RUNTIME_CLOSE_TIMEOUT = 18.0
+# Leave bounded time after service/owner retirement for pending-task drain and
+# the worker thread to observe loop.stop and finish its join.
+RUNTIME_DRAIN_TIMEOUT = 1.0
+RUNTIME_SHUTDOWN_HEADROOM = RUNTIME_DRAIN_TIMEOUT
+# Strict ceiling: a call must leave a complete minimum stdio shutdown budget
+# inside the fixed runtime close window, so an in-flight call cannot strand its
+# child after the runtime's loop deadline.
+MAX_CALL_TIMEOUT = DEFAULT_RUNTIME_CLOSE_TIMEOUT - MIN_SHUTDOWN_TIMEOUT
 MAX_REQUEST_BODY_BYTES = 64 * 1024
 MAX_RESPONSE_BYTES = 256 * 1024
 MAX_TOOL_NAME_BYTES = 256
@@ -116,6 +143,21 @@ _TRANSPORT_ERROR_CODES = frozenset(
         types.REQUEST_TIMEOUT,
     }
 )
+
+_DISCONNECT_EXCEPTIONS = (
+    ConnectionError,
+    EOFError,
+    anyio.ClosedResourceError,
+    anyio.BrokenResourceError,
+    anyio.EndOfStream,
+)
+
+
+def _is_confirmed_disconnect(exc: BaseException) -> bool:
+    if isinstance(exc, MCPError):
+        return exc.code == types.CONNECTION_CLOSED
+    return isinstance(exc, _DISCONNECT_EXCEPTIONS)
+
 
 SessionFactory: TypeAlias = Callable[[], Any]
 
@@ -186,9 +228,9 @@ def _consume_task_result(task: asyncio.Future[Any]) -> None:
 class _SessionOwner:
     """Keep one MCP context's entry and exit in the same asyncio task."""
 
-    def __init__(self, context: Any, *, close_timeout: float) -> None:
+    def __init__(self, context: Any, *, shutdown_timeout: float) -> None:
         self.context = context
-        self.close_timeout = close_timeout
+        self.shutdown_timeout = shutdown_timeout
         self.loop = asyncio.get_running_loop()
         self.ready: asyncio.Future[Any] = self.loop.create_future()
         self.ready.add_done_callback(_consume_task_result)
@@ -197,19 +239,84 @@ class _SessionOwner:
         self.session: Any | None = None
         self.entered = False
         self.exit_error: BaseException | None = None
+        self._retirement_done: asyncio.Future[None] = self.loop.create_future()
+        self._retirement_done.add_done_callback(_consume_task_result)
+        self._retirement_deadline: float | None = None
+        self._retirement_deadline_explicit = False
+        self._cold_retirement_requested = False
+        self._cold_cancel_sent = False
+
+    def _task_finished(self, task: asyncio.Task[Any]) -> None:
+        if not self._retirement_done.done():
+            self._retirement_done.set_result(None)
+        _consume_task_result(task)
+
+    def _set_retirement_deadline(self, deadline: float | None) -> None:
+        if deadline is None:
+            if self._retirement_deadline is None:
+                self._retirement_deadline = self.loop.time() + self.shutdown_timeout
+            return
+        if not self._retirement_deadline_explicit or self._retirement_deadline is None:
+            self._retirement_deadline = deadline
+            self._retirement_deadline_explicit = True
+        else:
+            self._retirement_deadline = min(self._retirement_deadline, deadline)
 
     def start(self) -> None:
         if self.task is not None:
             raise RuntimeError("session owner already started")
         self.task = asyncio.create_task(self._run(), name="imcp-session-owner")
-        self.task.add_done_callback(_consume_task_result)
+        self.task.add_done_callback(self._task_finished)
+        if self._cold_retirement_requested:
+            # A shutdown can be published after owner construction but before
+            # its task gets its first turn. Apply that pending request now.
+            self.request_close(
+                deadline=self._retirement_deadline,
+                cancel_cold=True,
+                stop_entered=False,
+            )
+
+    def request_close(
+        self,
+        *,
+        deadline: float | None = None,
+        cancel_cold: bool = False,
+        stop_entered: bool = True,
+    ) -> None:
+        """Begin retirement, cancelling only a shutdown-stalled cold context."""
+
+        self._set_retirement_deadline(deadline)
+        if cancel_cold:
+            self._cold_retirement_requested = True
+        task = self.task
+        if task is None or task.done():
+            return
+        if self.entered:
+            if stop_entered:
+                self.stop_event.set()
+            return
+        self.stop_event.set()
+        if not self._cold_retirement_requested:
+            return
+        if self._cold_cancel_sent:
+            return
+        self._cold_cancel_sent = True
+        # A context may have spawned stdio before its __aenter__ returns.  Its
+        # async-context-manager cancellation path owns the matching __aexit__;
+        # cancel in this cold phase so that path can reap the child promptly.
+        if not self.ready.done():
+            self.ready.set_exception(SessionUnavailableError(app_reachable=False))
+        if task.cancelling() == 0:
+            task.cancel()
 
     async def wait_ready(self, timeout: float) -> Any:
         self.start()
         try:
             return await _await_bounded(asyncio.shield(self.ready), timeout)
         except BaseException:
-            await self.close(cancel=True)
+            # Cold entry may be cancelled by shutdown, but the owner still
+            # performs any context cleanup in its own task before this returns.
+            await self.close()
             raise
 
     async def _run(self) -> None:
@@ -239,32 +346,36 @@ class _SessionOwner:
                         # owner records it for regression tests and still retires.
                         self.exit_error = exc
 
-    async def close(self, *, cancel: bool = False) -> None:
+    async def close(self, *, deadline: float | None = None) -> bool:
+        """Retire the owner once and wait until its context task is terminal.
+
+        The retirement deadline is one-shot; later deadline-free closes are
+        non-blocking terminal-state polls.
+        """
+
         task = self.task
         if task is None:
-            return
-        self.stop_event.set()
-        if cancel and not task.done():
-            task.cancel()
-        try:
-            await asyncio.wait_for(asyncio.shield(task), self.close_timeout)
-        except asyncio.TimeoutError:
-            if not task.done():
-                task.cancel()
-                task.add_done_callback(_consume_task_result)
-        except asyncio.CancelledError:
-            # A cancellation raised by the owner itself is cleanup completion;
-            # a cancellation of this caller is propagated after detaching it.
-            if task.cancelled():
-                return
-            if not task.done():
-                task.cancel()
-                task.add_done_callback(_consume_task_result)
-            raise
-        except BaseException:
-            # Context teardown is best effort and bounded; never leak lower
-            # layer exception details through the bridge.
+            return True
+        self.request_close(deadline=deadline)
+        if task.done():
             _consume_task_result(task)
+            return True
+        self._set_retirement_deadline(deadline)
+        retirement_deadline = self._retirement_deadline
+        if retirement_deadline is None:
+            return task.done()
+        remaining = retirement_deadline - self.loop.time()
+        if remaining <= 0:
+            return task.done()
+        try:
+            await asyncio.wait_for(asyncio.shield(self._retirement_done), remaining)
+        except asyncio.TimeoutError:
+            return task.done()
+        except asyncio.CancelledError:
+            # A cancelled caller does not cancel the owner or its retirement
+            # future; the same owner remains available to the next close.
+            raise
+        return task.done()
 
 
 async def _await_bounded(awaitable: Any, timeout: float) -> Any:
@@ -624,11 +735,12 @@ class BridgeService:
         token: str | None = None,
         allowlist: Iterable[str] = ("*",),
         session_factory: SessionFactory | None = None,
+        server_path: str | Path = DEFAULT_SERVER_PATH,
         call_timeout: float = DEFAULT_CALL_TIMEOUT,
-        discovery_timeout: float = DEFAULT_DISCOVERY_TIMEOUT,
-        connect_timeout: float = DEFAULT_CONNECT_TIMEOUT,
+        startup_timeout: float = DEFAULT_STARTUP_TIMEOUT,
         setup_timeout: float | None = None,
-        close_timeout: float = DEFAULT_CLOSE_TIMEOUT,
+        shutdown_timeout: float = DEFAULT_SHUTDOWN_TIMEOUT,
+        client_credential: str | None = None,
     ) -> None:
         # ``token`` is accepted for callers that keep auth and service config
         # together, but authentication is enforced by the HTTP handler.  Do
@@ -644,38 +756,54 @@ class BridgeService:
                 except ValueError as exc:
                     raise BridgeConfigurationError("allowlist entries must be valid tool names") from exc
         self._allowlist = entries
+        self._server_path = server_path
+        self._client_credential = client_credential
         self._call_timeout = _positive_timeout(call_timeout, label="call timeout")
-        self._discovery_timeout = _positive_timeout(discovery_timeout, label="discovery timeout")
-        self._connect_timeout = _positive_timeout(connect_timeout, label="connect timeout")
-        derived_setup_timeout = self._discovery_timeout * 2 + self._connect_timeout
+        self._startup_timeout = _positive_timeout(startup_timeout, label="startup timeout")
         self._setup_timeout = _positive_timeout(
-            derived_setup_timeout if setup_timeout is None else setup_timeout,
+            self._startup_timeout if setup_timeout is None else setup_timeout,
             label="setup timeout",
         )
-        self._close_timeout = _positive_timeout(close_timeout, label="close timeout")
+        self._shutdown_timeout = _positive_timeout(shutdown_timeout, label="shutdown timeout")
+        if self._shutdown_timeout < MIN_SHUTDOWN_TIMEOUT:
+            raise BridgeConfigurationError(
+                f"shutdown timeout must be at least {MIN_SHUTDOWN_TIMEOUT:g} seconds"
+            )
+        if self._call_timeout + self._shutdown_timeout >= DEFAULT_RUNTIME_CLOSE_TIMEOUT:
+            raise BridgeConfigurationError(
+                "call timeout plus shutdown timeout must be less than the runtime close budget"
+            )
+        # open_imcp_session closes ClientSession and the stdio transport in
+        # sequence, each with its own budget. Entered owners are never
+        # cancelled; a genuinely cold owner may be cancelled in its own task
+        # so a partially entered context can unwind and reap its child.
+        self._owner_shutdown_timeout = self._shutdown_timeout * 2 + 1.0
         self._session_factory = session_factory or self._default_session_factory
 
         self._lock = asyncio.Lock()
         self._session_owner: _SessionOwner | None = None
         self._session: Any | None = None
         self._session_known_dead = False
+        self._closing = False
+        self._closed = False
+        self._shutdown_deadline: float | None = None
         # None means no connection attempt has produced app reachability
         # evidence yet; subsequent attempts settle this to True or False.
         self._last_app_reachable: bool | None = None
 
     def _default_session_factory(self) -> Any:
-        # Every invocation creates a new shared-transport context.  The
-        # context performs a fresh Bonjour port discovery before connecting to
-        # the forced IPv4 loopback endpoint, including after reconnects.
+        # Every invocation creates a new stdio context, including after a
+        # reconnect.  The bundled executable is launched without a shell.
         return open_imcp_session(
+            server_path=self._server_path,
             client_info=types.Implementation(
                 name="stavrobot-imcp-bridge",
                 version="1.0.0",
             ),
             read_timeout_seconds=self._call_timeout,
-            discovery_timeout=self._discovery_timeout,
-            connect_timeout=self._connect_timeout,
-            close_timeout=self._close_timeout,
+            startup_timeout=self._startup_timeout,
+            shutdown_timeout=self._shutdown_timeout,
+            client_credential=self._client_credential,
         )
 
     @property
@@ -689,14 +817,32 @@ class BridgeService:
     def allows(self, name: str) -> bool:
         return "*" in self._allowlist or name in self._allowlist
 
-    async def _close_session_locked(self) -> None:
+    async def _close_session_locked(self, *, deadline: float | None = None) -> bool:
         owner = self._session_owner
-        self._session_owner = None
         self._session = None
         if owner is None:
-            return
+            return True
+        completed = False
         with suppress(BaseException):
-            await owner.close()
+            completed = await owner.close(deadline=deadline)
+        if completed and self._session_owner is owner:
+            self._session_owner = None
+        return completed
+
+    def _begin_shutdown(self, deadline: float | None = None) -> None:
+        self._closing = True
+        if deadline is not None:
+            if self._shutdown_deadline is None:
+                self._shutdown_deadline = deadline
+            else:
+                self._shutdown_deadline = min(self._shutdown_deadline, deadline)
+        owner = self._session_owner
+        if owner is not None:
+            owner.request_close(
+                deadline=self._shutdown_deadline,
+                cancel_cold=True,
+                stop_entered=False,
+            )
 
     @staticmethod
     def _bounded_phase_timeout(configured: float, deadline: float | None) -> float:
@@ -710,12 +856,20 @@ class BridgeService:
         return min(configured, remaining)
 
     async def _ensure_session_locked(self, *, deadline: float | None = None) -> Any:
+        if self._closing or self._closed:
+            raise SessionUnavailableError(app_reachable=False)
         if self._session is not None and not self._session_known_dead:
-            return self._session
+            if await self._session_responds_locked(self._session, deadline):
+                return self._session
+            # imcp-server exits when its iMCP connection ends.  Nothing has
+            # been dispatched yet, so retire it and relaunch for this request.
+            self._session_known_dead = True
 
         # A known-dead session is retired before this new request is
         # dispatched.  This is the only reconnect point in the bridge.
-        await self._close_session_locked()
+        retired = await self._close_session_locked(deadline=self._shutdown_deadline)
+        if not retired:
+            raise SessionUnavailableError(app_reachable=False)
         self._session_known_dead = False
 
         try:
@@ -731,8 +885,14 @@ class BridgeService:
                     raise
                 candidate = await _await_bounded(candidate, setup_timeout)
             context = candidate if callable(getattr(candidate, "__aenter__", None)) else _SessionOnlyContext(candidate)
-            owner = _SessionOwner(context, close_timeout=self._close_timeout)
+            owner = _SessionOwner(context, shutdown_timeout=self._owner_shutdown_timeout)
             self._session_owner = owner
+            if self._closing:
+                owner.request_close(
+                    deadline=self._shutdown_deadline,
+                    cancel_cold=True,
+                    stop_entered=False,
+                )
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -740,29 +900,52 @@ class BridgeService:
             raise SessionUnavailableError(app_reachable=False) from None
 
         try:
-            # ``open_imcp_session().__aenter__`` includes Bonjour observation,
-            # service-detail resolution, and TCP connect.  Its bound must
-            # cover all three phases rather than using connect_timeout alone.
+            # ``open_imcp_session().__aenter__`` launches the bundled stdio
+            # server and creates the SDK streams.  Keep its bound separate
+            # from the MCP initialize/read deadline.
             setup_timeout = self._bounded_phase_timeout(self._setup_timeout, deadline)
             session = await owner.wait_ready(setup_timeout)
             self._session = session
             self._last_app_reachable = True
+            if self._closing:
+                raise SessionUnavailableError(app_reachable=True)
             initialize_timeout = self._bounded_phase_timeout(self._call_timeout, deadline)
             await _await_bounded(session.initialize(), initialize_timeout)
             return session
         except asyncio.CancelledError:
             self._last_app_reachable = owner.entered
-            await self._close_session_locked()
+            await self._close_session_locked(deadline=self._shutdown_deadline)
             raise
         except Exception:
             self._last_app_reachable = owner.entered
-            await self._close_session_locked()
+            await self._close_session_locked(deadline=self._shutdown_deadline)
             raise SessionUnavailableError(app_reachable=owner.entered) from None
+
+    async def _session_responds_locked(self, session: Any, deadline: float | None) -> bool:
+        """Liveness-check an idle session before dispatching a request to it."""
+
+        send_ping = getattr(session, "send_ping", None)
+        if not callable(send_ping):
+            return True
+        try:
+            timeout = self._bounded_phase_timeout(self._call_timeout, deadline)
+            await _await_bounded(send_ping(), timeout)
+        except asyncio.CancelledError:
+            raise
+        except asyncio.TimeoutError:
+            # Exhausted budget or slow ping is not proof of a disconnect:
+            # keep the session and fail only this request (nothing dispatched).
+            raise SessionUnavailableError(app_reachable=True) from None
+        except Exception as exc:
+            if _is_confirmed_disconnect(exc):
+                return False
+            raise SessionUnavailableError(app_reachable=True) from None
+        return True
 
     async def _mark_session_dead_locked(self) -> None:
         self._session_known_dead = True
         self._last_app_reachable = False
-        await self._close_session_locked()
+        await self._close_session_locked(deadline=self._shutdown_deadline)
 
     async def mark_session_dead(self) -> None:
         """Mark the persistent session dead for deterministic tests/shutdown."""
@@ -831,6 +1014,11 @@ class BridgeService:
         async with self._lock:
             try:
                 session = await self._ensure_session_locked(deadline=deadline)
+                if self._closing:
+                    return self._unavailable_response(
+                        tool_name=name,
+                        app_reachable=self._last_app_reachable,
+                    )
             except SessionUnavailableError as exc:
                 return self._unavailable_response(tool_name=name, app_reachable=exc.app_reachable)
             except asyncio.CancelledError:
@@ -924,6 +1112,11 @@ class BridgeService:
         async with self._lock:
             try:
                 session = await self._ensure_session_locked(deadline=deadline)
+                if self._closing:
+                    return self._unavailable_response(
+                        tool_name="list_tools",
+                        app_reachable=self._last_app_reachable,
+                    )
             except SessionUnavailableError as exc:
                 return self._unavailable_response(tool_name="list_tools", app_reachable=exc.app_reachable)
             except asyncio.CancelledError:
@@ -1056,11 +1249,18 @@ class BridgeService:
             )
         return await self._call_tool(name, arguments, deadline=deadline)
 
-    async def close(self) -> None:
+    async def close(self, *, deadline: float | None = None) -> None:
+        # Set the gate and request cold-owner retirement before waiting for the
+        # lock so queued requests cannot reconnect after shutdown begins.
+        self._begin_shutdown(deadline)
         async with self._lock:
-            await self._close_session_locked()
+            if self._closed:
+                await self._close_session_locked(deadline=self._shutdown_deadline)
+                return
+            await self._close_session_locked(deadline=self._shutdown_deadline)
             self._session_known_dead = True
             self._last_app_reachable = False
+            self._closed = True
 
 
 class AsyncBridgeRuntime:
@@ -1076,13 +1276,39 @@ class AsyncBridgeRuntime:
         self._started = False
         self._closed = False
         self._closing_thread: threading.Thread | None = None
+        self._runtime_shutdown_end: float | None = None
 
     async def _drain_pending(self, pending: set[asyncio.Task[Any]]) -> None:
+        owner_task = self.service._session_owner.task if self.service._session_owner is not None else None
+        owner_tasks = {
+            task
+            for task in pending
+            if task is owner_task or task.get_name() == "imcp-session-owner"
+        }
+        # Give an owner and the SDK task group all remaining runtime budget.
+        # Cancelling any of these tasks externally can interrupt stdio cleanup
+        # and orphan its subprocess, so unrelated tasks wait until the owner is
+        # terminal before they are cancelled.
+        runtime_shutdown_end = self._runtime_shutdown_end
+        remaining = (
+            max(0.0, runtime_shutdown_end - time.monotonic())
+            if runtime_shutdown_end is not None
+            else RUNTIME_DRAIN_TIMEOUT
+        )
+        if owner_tasks:
+            await asyncio.wait(owner_tasks, timeout=remaining)
+            if any(not task.done() for task in owner_tasks):
+                return
+
         for task in pending:
-            task.cancel()
-        # A user coroutine can ignore cancellation.  Do not let one such task
-        # keep the runtime thread alive indefinitely during loop teardown.
-        await asyncio.wait(pending, timeout=self.service._close_timeout)
+            if task not in owner_tasks:
+                task.cancel()
+        remaining = (
+            max(0.0, runtime_shutdown_end - time.monotonic())
+            if runtime_shutdown_end is not None
+            else RUNTIME_DRAIN_TIMEOUT
+        )
+        await asyncio.wait(pending, timeout=min(RUNTIME_DRAIN_TIMEOUT, remaining))
 
     def _run(self) -> None:
         try:
@@ -1158,10 +1384,13 @@ class AsyncBridgeRuntime:
             future.cancel()
             raise
 
-    async def _shutdown_service(self) -> None:
-        await self.service.close()
+    async def _shutdown_service(self, deadline: float) -> None:
+        await self.service.close(deadline=deadline)
 
     def close(self) -> None:
+        """Stop the worker within one bounded launchd-compatible budget."""
+
+        deadline = time.monotonic() + DEFAULT_RUNTIME_CLOSE_TIMEOUT
         current = threading.current_thread()
         with self._state_lock:
             if self._closed:
@@ -1171,11 +1400,12 @@ class AsyncBridgeRuntime:
             else:
                 self._closed = True
                 self._closing_thread = current
+                self._runtime_shutdown_end = deadline
                 wait_for_close = False
                 started = self._started
 
         if wait_for_close:
-            self._closed_event.wait(timeout=self.service._close_timeout + 2.0)
+            self._closed_event.wait(timeout=max(0.0, deadline - time.monotonic()))
             return
 
         if not started:
@@ -1186,30 +1416,37 @@ class AsyncBridgeRuntime:
             self._closed_event.set()
             return
 
-        self._ready.wait()
+        self._ready.wait(timeout=max(0.0, deadline - time.monotonic()))
+        service_deadline = deadline - RUNTIME_SHUTDOWN_HEADROOM
         if current is self._thread:
             if self.loop.is_running():
-                task = self.loop.create_task(self._shutdown_service())
+                self.service._begin_shutdown(service_deadline)
+                task = self.loop.create_task(self._shutdown_service(service_deadline))
                 task.add_done_callback(lambda _task: self.loop.call_soon(self.loop.stop))
             return
 
-        shutdown_coroutine = self._shutdown_service()
+        # Publish the shared, headroom-adjusted deadline before the shutdown
+        # coroutine waits on the service lock.  An in-flight cold request can
+        # then retire its owner without consuming the drain/join budget.
+        shutdown_coroutine = self._shutdown_service(service_deadline)
         future: concurrent.futures.Future[Any] | None = None
         try:
+            self.loop.call_soon_threadsafe(self.service._begin_shutdown, service_deadline)
             future = asyncio.run_coroutine_threadsafe(shutdown_coroutine, self.loop)
-            future.result(timeout=self.service._close_timeout + 1.0)
+            # The wait is shielded by the thread boundary: timeout must not
+            # cancel the service coroutine or its owner/stdio teardown.
+            future.result(timeout=max(0.0, deadline - time.monotonic()))
+        except concurrent.futures.TimeoutError:
+            # Leave the owner task on the loop. The final loop stop is bounded
+            # separately below; no cancellation is sent into SDK teardown.
+            pass
         except BaseException:
-            if future is not None:
-                with suppress(BaseException):
-                    future.cancel()
-            else:
+            if future is None:
                 self._discard_awaitable(shutdown_coroutine)
-            if self.loop.is_running():
-                self.loop.call_soon_threadsafe(self.loop.stop)
         finally:
             if self.loop.is_running():
                 self.loop.call_soon_threadsafe(self.loop.stop)
-            self._thread.join(timeout=self.service._close_timeout + 1.0)
+            self._thread.join(timeout=max(0.0, deadline - time.monotonic()))
             if not self._thread.is_alive():
                 self._closed_event.set()
 
@@ -1399,6 +1636,12 @@ class BridgeRequestHandler(BaseHTTPRequestHandler):
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--token-file", type=Path, required=True, help="trusted bearer-token file")
+    parser.add_argument(
+        "--client-credential-file",
+        type=Path,
+        default=None,
+        help="optional private file holding the iMCP 1.8.2+ client credential",
+    )
     parser.add_argument("--bind", default=DEFAULT_BIND, help="HTTP bind address")
     parser.add_argument("--port", type=int, default=DEFAULT_PORT, help="HTTP port")
     parser.add_argument("--path", default=DEFAULT_PATH, help="HTTP bridge path")
@@ -1432,6 +1675,12 @@ def _validate_port(port: int) -> int:
     return port
 
 
+def _handle_sigterm(_signum: int, _frame: Any) -> None:
+    """Turn launchd's stop signal into the normal runtime.close path."""
+
+    raise KeyboardInterrupt
+
+
 def main(argv: list[str] | None = None) -> int:
     args = _parse_args(argv)
     # CLI startup owns logging configuration; importing the bridge remains
@@ -1442,9 +1691,16 @@ def main(argv: list[str] | None = None) -> int:
         _validate_port(args.port)
         bridge_path = _normalize_path(args.path)
         allowlist = frozenset(args.allow_tool) if args.allow_tool is not None else load_allowlist(args.allowlist_file)
+        client_credential = None
+        if args.client_credential_file is not None:
+            try:
+                client_credential = load_client_credential(args.client_credential_file)
+            except TransportConfigurationError as exc:
+                raise BridgeConfigurationError(str(exc)) from None
         service = BridgeService(
             allowlist=allowlist,
             call_timeout=args.call_timeout,
+            client_credential=client_credential,
         )
         runtime = AsyncBridgeRuntime(service)
         runtime.start()
@@ -1463,13 +1719,22 @@ def main(argv: list[str] | None = None) -> int:
         print(f"bridge startup failed: {exc}", flush=True)
         return 1
 
+    previous_sigterm = signal.signal(signal.SIGTERM, _handle_sigterm)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
         pass
     finally:
-        server.server_close()
-        runtime.close()
+        # launchd may repeat SIGTERM while cleanup is still draining the MCP
+        # owner. Ignore repeats until both server and runtime cleanup finish.
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        try:
+            server.server_close()
+        finally:
+            try:
+                runtime.close()
+            finally:
+                signal.signal(signal.SIGTERM, previous_sigterm)
     return 0
 
 

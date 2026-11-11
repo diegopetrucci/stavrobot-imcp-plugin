@@ -9,8 +9,8 @@ The bridge exposes an authenticated HTTP boundary for the iMCP services enabled
 by the operator:
 
 ```text
-iMCP app (macOS permissions and client approval)
-  -> local MCP transport (Bonjour discovery, forced loopback)
+iMCP app (>=1.8.2; macOS permissions and client approval)
+  -> bundled Contents/MacOS/imcp-server over stdio
   -> 127.0.0.1:8766/bridge (authenticated host bridge)
   -> host.docker.internal:8766/bridge (plugin-runner)
   -> Stavrobot imcp plugin
@@ -21,7 +21,9 @@ iMCP app (macOS permissions and client approval)
 1. Obtain explicit human approval for the services, tools, agents, and first
    read-only test operation. iMCP can expose personal calendar, contacts,
    messages, reminders, location, maps, and weather data; enable only the
-   services that have been selected.
+   services that have been selected. The bundled stdio entrypoint is supported
+   only by iMCP **1.8.2 or newer**; verify the selected app version and
+   `Contents/MacOS/imcp-server` before starting the bridge.
 2. Keep the bridge bound to `127.0.0.1` and use the fixed HTTP bridge port
    `8766`. Do **not** change the bind to `0.0.0.0` automatically if the
    container check fails. Stop and diagnose the host-gateway path instead.
@@ -32,23 +34,32 @@ iMCP app (macOS permissions and client approval)
 4. Use a trusted host allowlist with explicit iMCP tool names. Although
    `bridge/server.py` defaults to `*` when no allowlist is supplied, deployment
    through the helper or LaunchAgent wrapper below requires
-   `~/.config/imcp-bridge-tools.json` so least privilege is deliberate. A live
-   `*` entry is not a fixed snapshot: when a later iMCP release adds a tool,
-   the existing wildcard admits it without an allowlist edit. The live
-   wildcard configuration is intentionally unchanged here; before relying on
-   it after an upgrade, review the release notes and a fresh read-only
-   `tools/list` result, and obtain explicit approval for the expanded surface.
+   `~/.config/imcp-bridge-tools.json` so least privilege is deliberate.
 5. Keep the timeout ladder intact:
    `15s (bridge) < 20s (plugin client) < 30s (synchronous plugin-runner)`.
-   The helper and LaunchAgent wrapper explicitly pin the bridge's 10-second
-   `--call-timeout` default, which yields its 15-second outer deadline. Any
-   override must keep the resulting bridge outer deadline strictly below the
-   plugin's 20 seconds.
+   The bundled stdio startup has a separate 5-second bound, and the helper and
+   LaunchAgent wrapper explicitly pin the bridge's 10-second `--call-timeout`
+   default, which yields its 15-second outer deadline. The SDK's stdio shutdown
+   escalation is bounded at 6.5 seconds, with a 7-second configuration floor.
+   The 18-second runtime-close invariant therefore imposes a strict `<11s`
+   ceiling on `--call-timeout` (`call timeout + shutdown timeout < 18s`); a
+   larger shutdown setting lowers that ceiling. Any override must keep the
+   resulting bridge outer deadline strictly below the plugin's 20 seconds and
+   leave enough time for stdio teardown.
 6. Use exactly one supervisor at a time: either the tmux start helper or the
    direct LaunchAgent template below. Running both causes a collision on
    `127.0.0.1:8766`.
 
 ## Prerequisites and virtual environment
+
+The stdio migration requires an installed iMCP app at version **1.8.2 or
+newer** with its bundled server executable. Check both before preparing the
+bridge; do not continue with an older app or a missing executable:
+
+```sh
+mdls -name kMDItemVersion -raw /Applications/iMCP.app
+test -x /Applications/iMCP.app/Contents/MacOS/imcp-server
+```
 
 In a trusted local terminal, prepare the checkout and its explicit Python
 virtual environment. These commands are instructions for a later operator;
@@ -65,165 +76,26 @@ The start helper and plist intentionally invoke
 interactive shell happens to select. If the checkout is elsewhere, render or
 adapt the paths deliberately rather than adding a second, untracked runtime.
 
-## Installed iMCP app upgrade and rollback
-
-The local app was upgraded from 1.5.3 to upstream 1.6.0 using the
-[1.6.0 release](https://github.com/mattt/iMCP/releases/tag/1.6.0) and its
-[`iMCP.zip`](https://github.com/mattt/iMCP/releases/download/1.6.0/iMCP.zip)
-asset. The asset SHA-256 is
-`74fe4271f9a2264b30a028f063f0c346ff9c0a26f59a2a4b60147ed33936f1b6`. Before
-replacement, the new bundle was verified as notarized Developer ID Application
-`dododo, LLC` with TeamIdentifier `TTY35UM57S`, matching the previous trusted
-bundle. Sparkle automatic updates can replace the app bundle again on a later
-check or launch, including after an app-only rollback. The complete 1.5.3
-rollback bundle is retained outside the app at:
-
-```text
-$HOME/Backups/iMCP/iMCP-1.5.3-20260926T093442Z.app
-```
-
-To roll back only the app, leaving the sandbox container, macOS permissions,
-operator service selections, bridge allowlist, and LaunchAgents untouched, save
-this block as a temporary script, review it, and run it as one script (for
-example, `sh /path/to/imcp-rollback.sh`) from the logged-in macOS account; do
-not paste individual lines into an interactive shell. The temporary failed-new
-bundle is kept until the restored backup passes its signature checks:
-
-```sh
-set -eu
-backup="$HOME/Backups/iMCP/iMCP-1.5.3-20260926T093442Z.app"
-current=/Applications/iMCP.app
-rollback_tmp="$(mktemp -d /private/tmp/imcp-rollback.XXXXXX)"
-staging="$rollback_tmp/iMCP.app.1.6.0"
-
-if ! /usr/libexec/PlistBuddy -c 'Print:CFBundleShortVersionString' \
-    "$backup/Contents/Info.plist" | grep -Fx 1.5.3; then
-  echo "backup version check failed; refusing rollback" >&2
-  exit 1
-fi
-if ! codesign --verify --deep --strict "$backup"; then
-  echo "backup code-signing check failed; refusing rollback" >&2
-  exit 1
-fi
-if ! spctl --assess --type execute "$backup"; then
-  echo "backup notarization check failed; refusing rollback" >&2
-  exit 1
-fi
-osascript -e 'tell application id "co.dododo.iMCP" to quit' || true
-for _ in $(seq 1 30); do
-  if ! /usr/bin/pgrep -x iMCP >/dev/null 2>&1; then break; fi
-  sleep 1
-done
-if /usr/bin/pgrep -x iMCP >/dev/null 2>&1; then
-  echo "iMCP did not quit; refusing rollback" >&2
-  exit 1
-fi
-
-restore_original_app() {
-  rm -rf "$current"
-  mv "$staging" "$current"
-}
-
-mv "$current" "$staging"
-if ! ditto --rsrc --extattr --acl "$backup" "$current"; then
-  restore_original_app
-  exit 1
-fi
-if ! /usr/libexec/PlistBuddy -c 'Print:CFBundleShortVersionString' \
-    "$current/Contents/Info.plist" | grep -Fx 1.5.3; then
-  echo "restored app version check failed; restoring original app" >&2
-  restore_original_app
-  exit 1
-fi
-if ! codesign --verify --deep --strict "$current"; then
-  echo "restored app code-signing check failed; restoring original app" >&2
-  restore_original_app
-  exit 1
-fi
-if ! spctl --assess --type execute "$current"; then
-  echo "restored app notarization check failed; restoring original app" >&2
-  restore_original_app
-  exit 1
-fi
-rm -rf "$rollback_tmp"
-/usr/bin/open -g "$current"
-for _ in $(seq 1 30); do
-  if /usr/bin/pgrep -x iMCP >/dev/null 2>&1; then break; fi
-  sleep 1
-done
-if ! /usr/bin/pgrep -x iMCP >/dev/null 2>&1; then
-  echo "iMCP did not relaunch after rollback; verify it manually" >&2
-  exit 1
-fi
-if ! /usr/libexec/PlistBuddy -c 'Print:CFBundleShortVersionString' \
-    "$current/Contents/Info.plist" | grep -Fx 1.5.3; then
-  echo "post-relaunch version is not 1.5.3; Sparkle may have updated the app" >&2
-  exit 1
-fi
-```
-
-If Sparkle automatic updates are enabled, treat that post-relaunch check as a
-point-in-time verification rather than a permanent pin. The iMCP/Sparkle
-**Settings > Updates** controls are named **Automatically check for updates**
-(`SUEnableAutomaticChecks`) and **Automatically download updates**
-(`SUAutomaticallyUpdate`). To record the current values without exposing
-unrelated preferences, read only these named keys:
-
-```sh
-/usr/bin/defaults read co.dododo.iMCP SUEnableAutomaticChecks
-/usr/bin/defaults read co.dododo.iMCP SUAutomaticallyUpdate
-/usr/bin/defaults read co.dododo.iMCP SUSendProfileInfo
-```
-
-The installed 1.6.0 app was inspected without changing it on 2026-09-26;
-the two update controls were enabled (`1`), and **Send system profile
-information** (`SUSendProfileInfo`) was disabled (`0`). These values are an
-observation of the live defaults, not a setting change made by this task.
-
-Before a durable rollback, obtain explicit approval to turn off both
-**Automatically check for updates** and **Automatically download updates** in
-the iMCP/Sparkle Updates controls. Quit iMCP and verify that it has exited
-before making either approved preference change; do not write Sparkle
-preferences while iMCP is running. For this build, the visible iMCP menu
-contains **Check for Updates...**, while the durable controls are Sparkle's
-named settings above; if the Settings > Updates pane is not exposed, apply the
-same approved change explicitly from a trusted terminal after that quit check:
-
-```sh
-/usr/bin/defaults write co.dododo.iMCP SUEnableAutomaticChecks -bool false
-/usr/bin/defaults write co.dododo.iMCP SUAutomaticallyUpdate -bool false
-```
-
-Leave iMCP quit after changing those controls and run the app-only rollback
-script above; it repeats the quit check before replacing the app and relaunches
-the restored 1.5.3 bundle. Verify 1.5.3 again after relaunch. Leave both
-controls disabled for a durable rollback, or restore their recorded prior
-values only after an operator explicitly approves automatic updates again.
-This task does not change either setting. After every upgrade or rollback,
-manually quit and relaunch iMCP before a metadata capture; the probe then
-verifies that the running process is the selected app executable and that its
-PID and filesystem identity remain unchanged through `tools/list`. It fails
-closed instead of terminating or relaunching a mismatched process.
-
-Do not delete the app container, reset TCC permissions, enable services, edit
-the allowlist, or reload LaunchAgents as part of this app-only rollback.
-
 ## 1. Manually prepare iMCP and macOS permissions
 
 All prompts and approvals in this section are manual:
 
-1. Open the installed iMCP app in the logged-in macOS user session.
+1. Open the installed iMCP app in the logged-in macOS user session and verify
+   that it is **1.8.2 or newer** with the executable checked in the prerequisite
+   section above.
 2. Enable only the agreed iMCP services. Do not infer availability from an
    upstream source checkout or from an old tool list.
 3. In **System Settings > Privacy & Security**, grant only the macOS access
    required by those services. Complete any iMCP-native permission flow. For
    Messages history, use the app's documented file-selection flow if it asks
    for access; this integration does not describe or test message sending.
-4. Start the bridge once the app is ready. On the first MCP connection, iMCP
-   may display a **Connection Request** window for the client named
-   `stavrobot-imcp-bridge`. Review the client and approve it manually. Do not
-   treat a missing prompt as proof that permissions or client trust are correct;
-   check the app's remembered-client and service settings.
+4. Start the bridge after the app is ready. The first authenticated
+   `list_tools` request launches the bundled `imcp-server` over stdio. iMCP may
+   display a **Connection Request** window for the client named
+   `stavrobot-imcp-bridge`; review the client and approve it manually. A
+   remembered approval may suppress later prompts, but a missing prompt is not
+   proof that permissions or client trust are correct. Check the app's
+   remembered-client and service settings.
 5. Use a disposable, read-only operation for the first end-to-end test. Do not
    use a write, delete, message, reminder, or calendar mutation as a health
    check.
@@ -298,6 +170,53 @@ these file modes.
 The allowlist contains no credential, but keep it owner-only so it cannot be
 silently broadened by another account.
 
+### 2.1 Tiered allowlist guidance (iMCP 1.8.x)
+
+Group tools into tiers and opt in explicitly, one tool name at a time. Verify
+names against the installed app's `tools/list` (`scripts/probe_imcp.py`); this
+list reflects iMCP 1.8.3.
+
+- **Read-only tier** (reasonable starting point once the service is approved):
+  `calendars_list`, `events_fetch`, `contacts_list`, `contacts_me`,
+  `contacts_search`, `messages_fetch`, `reminders_fetch`, `reminders_lists`,
+  `phone_calls_fetch`, `voicemails_fetch`, `voicemail_transcript_fetch`,
+  `mail_mailboxes_list`, `mail_messages_search`, `mail_messages_read`,
+  `notes_folders`, `notes_fetch`, `notes_read`, `voice_memos_fetch`,
+  `voice_memo_transcript_fetch`, `music_now_playing`, `music_catalog_search`,
+  `location_current`, `location_geocode`, `location_reverse-geocode`, `maps_search`, `maps_directions`,
+  `maps_eta`, `maps_explore`, `maps_generate`, `weather_current`,
+  `weather_hourly`, `weather_daily`, `weather_minute`, `shortcuts_list`, and
+  the Home read tools (`homes_list`, `home_export`, `rooms_list`, `zones_list`,
+  `accessories_list`, `accessories_get`, `characteristics_read`,
+  `scenes_list`, `automations_list`). `messages_attachment_read`,
+  `voicemail_audio_fetch` and `voice_memo_audio_fetch` return large binary data
+  (see limits below) and are sensitive even though they are reads.
+- **Write / side-effect tier** (enable only with explicit approval per tool):
+  `events_create`, `events_update`, `events_delete`, `contacts_create`,
+  `contacts_update`, `reminders_create`, `reminders_update`,
+  `reminders_delete`, `reminders_lists_create`, `reminders_lists_rename`,
+  `reminders_lists_delete`, `mail_compose` (opens a draft), `music_control`,
+  `phone_call`, `shortcuts_run`, `utilities_beep`, the capture tools
+  (`capture_take_picture`, `capture_record_audio`, `capture_take_screenshot`),
+  and every Home write tool (`characteristics_write`, `scenes_execute`,
+  `scenes_create`/`_update`/`_remove`, `automations_create`/`_update`/`_remove`,
+  `accessories_identify`/`_rename`/`_assign_room`/`_remove`, `services_rename`,
+  `rooms_create`/`_rename`/`_remove`, `zones_create`/`_update`/`_remove`). Delete/remove
+  tools are destructive. `shortcuts_run` can do anything the shortcut does.
+
+Never use `*`. Do not use a write-tier tool as a health check.
+
+### 2.2 Limits and folder access
+
+- The bridge caps each response at 256 KiB and each call at 10 seconds. Large
+  binary results (voicemail and voice-memo audio, message attachments, camera
+  or screenshot captures) may be truncated (`truncated: true`) or fail; text
+  results and transcripts work.
+- Mail, Notes, Voice Memos, Voicemail, and Messages attachments need folder
+  access granted inside iMCP (its service settings) in addition to macOS
+  privacy permissions. Home requires the self-signed iMCP Helper to be paired
+  per the upstream iMCP README.
+
 ## 3. Start the host bridge
 
 The in-repository helper is `scripts/start-stavrobot-imcp-bridge`. It sets the
@@ -325,9 +244,11 @@ start converges on one session; it does not kill other tmux sessions or print
 session, it fails clearly and leaves the existing listener alone. Do not work
 around that error by changing the bridge port or exposing another interface.
 The helper passes `--allowlist-file ~/.config/imcp-bridge-tools.json` and
-`--call-timeout 10`; do not remove either safety boundary. The dynamic port
-used internally by iMCP is not a plugin or HTTP port and must not be added to
-configuration or logs.
+`--call-timeout 10`; do not remove either safety boundary. The bridge launches
+`/Applications/iMCP.app/Contents/MacOS/imcp-server` as a local child over stdio
+on demand. There is no iMCP TCP port to configure, discover, expose, or add to
+logs; only the fixed authenticated HTTP bridge endpoint is part of the plugin
+contract.
 
 ### 3.1 Trigger the first host-side MCP connection and approve it manually
 
@@ -355,6 +276,14 @@ reaches the 20-second client timeout), wait for the command to exit and rerun
 read-only discovery request is safe; do not generalize that retry rule to a
 `call_tool` whose outcome could be unknown. The helper never invokes an iMCP
 tool and never retries automatically.
+
+The bridge keeps a successful MCP session open for later requests. If iMCP or
+`imcp-server` exits, the next request reconnects lazily by launching a fresh
+stdio child; it does not replay a call. If a `call_tool` may have been
+dispatched before its response was lost, treat `error.code: "unknown_outcome"`
+as non-retryable and inspect the app before any further action. A later
+read-only `list_tools` request can establish the fresh session after approval
+or startup recovery.
 
 The unauthenticated GET in §6.1 is only a route/authentication check. It cannot
 trigger iMCP client approval because the bridge rejects it before opening an
@@ -708,7 +637,10 @@ launchctl bootout "gui/$(id -u)/com.stavrobot.imcp"
 launchctl bootout "gui/$(id -u)/com.stavrobot.imcp-app"
 ```
 
-Use one bridge supervisor, never tmux and launchd together.
+Allow up to 18 seconds for the bridge's graceful `launchctl bootout` drain
+before treating it as stuck. Do not force-kill the bridge or remove either
+plist prematurely during that window. Use one bridge supervisor, never tmux
+and launchd together.
 
 Logs are in `~/Library/Logs/Stavrobot/imcp-bridge.{out,err}.log`. The launch job
 uses umask 077. Treat logs as operational data and avoid publishing them.
@@ -732,6 +664,10 @@ causes launchd to restart it). Remove/disable both login jobs to undo startup:
 launchctl bootout "gui/$(id -u)/com.stavrobot.imcp"
 launchctl bootout "gui/$(id -u)/com.stavrobot.imcp-app"
 ```
+
+Allow up to 18 seconds for the bridge's graceful `launchctl bootout` drain
+before treating it as stuck. Do not force-kill the bridge or remove either
+plist prematurely during that window.
 
 Remove the corresponding managed LaunchAgent files only when uninstalling.
 Keep private credentials unless intentionally removing or rotating them.
@@ -781,37 +717,71 @@ and that every `telegram-group-*` agent's actual `allowed_plugins` value
 excludes iMCP. Keep the source bundle and this runbook if a later re-deployment
 is approved.
 
-## Temporary dynamic-port / forced-loopback workaround
+## Upgrading to iMCP 1.8.2+ (client credential)
+iMCP 1.8.2 fixes security advisories GHSA-pfc6-qp66-c2ff and
+GHSA-q4pc-f59f-9xmw and is the minimum supported version. Operator steps:
+1. Stop the bridge supervisor (tmux session or LaunchAgent, see **Rollback and
+   uninstall**), then update iMCP.app to 1.8.2 or newer and open it.
+2. Start the bridge and run `./scripts/check_bridge.sh`. When iMCP shows the
+   **Connection Request** for `stavrobot-imcp-bridge`, approve it and choose
+   **Always trust this client**. iMCP then shows a client credential once.
+3. Store it privately without echoing it. Remove any old file first (umask
+   does not tighten an existing one), then paste at the silent prompt and press
+   Return:
+   ```sh
+   rm -f "$HOME/.config/imcp-client.credential"
+   ( umask 077; IFS= read -rs cred && printf '%s\n' "$cred" > "$HOME/.config/imcp-client.credential" )
+   chmod 600 "$HOME/.config/imcp-client.credential"
+   ```
+   Never put it in chat, logs, shell history, the plist, or Git. Mode 0400 or
+   0600 is accepted.
+4. Restart the bridge. The start helper and `scripts/run_launchd_bridge.py`
+   pass `--client-credential-file` only when that file exists (an existing file
+   must be private); `scripts/probe_imcp.py` accepts the same option. The bridge
+   pings a reused session before each request and relaunches `imcp-server` if it
+   exited, without replaying a call.
+5. Re-run `./scripts/check_bridge.sh`, then review the allowlist per §2.1.
+Undo: stop the bridge, delete `~/.config/imcp-client.credential`, remove the
+trusted client in iMCP's settings (revokes the credential), and restart; the
+next connection will prompt for approval again. Reverting to an app older than
+1.8.2 is unsupported.
+## Stdio transport migration and rollback
 
-The iMCP app's local MCP service advertises a Bonjour `_mcp._tcp.local.` service
-with a dynamic internal port. The current transport uses Bonjour only to
-identify the local service and extract that port; it discards all advertised
-interface addresses and connects exclusively to `127.0.0.1:<discovered-port>`.
-The Stavrobot-facing HTTP boundary is separately fixed at
-`127.0.0.1:8766/bridge`. The discovered iMCP port is an internal implementation
-detail: it is not a plugin URL, must not be hard-coded, and must not be printed
-in operational output.
+This revision uses the supported bundled `imcp-server` stdio entrypoint from
+iMCP **1.8.2 or newer**. The HTTP boundary remains
+`127.0.0.1:8766/bridge`; the plugin URL, Bearer authentication, JSON operation
+names, response envelope, allowlist, and no-LAN-exposure rule do not change.
+There is no internal iMCP TCP endpoint to configure or expose.
 
-This forced-loopback/dynamic-port arrangement is a temporary compatibility
-workaround while a stable, documented host/container transport is tracked:
+If the selected app is older than 1.8.2, the bundled executable is missing or
+not executable, or the stdio migration fails its read-only verification, stop
+before invoking a tool. Do not copy individual transport files or reintroduce a
+manually selected port into this revision.
 
-- [stavrobot-imcp-plugin issue #1](https://github.com/diegopetrucci/stavrobot-imcp-plugin/issues/1)
-- [upstream mattt/iMCP issue #142](https://github.com/mattt/iMCP/issues/142)
+### Roll back to the prior custom transport
 
-Do not remove the workaround merely because one live call succeeds. Remove or
-replace it only after all of the following are true:
+To roll back the migration, perform a complete deployment rollback to the last
+known-good repository revision (or release artifact) that contains the prior
+custom TCP transport. That revision must be used with its own matching
+requirements; do not mix the old transport with this revision's source or
+virtual environment.
 
-- a released iMCP version, including the version actually installed by the
-  operator, documents a stable supported transport or configurable endpoint;
-- the relevant upstream/project issue status and security implications have
-  been reviewed;
-- reconnect after an iMCP restart and a changed internal port is tested;
-- authenticated reachability is reverified from `plugin-runner` through
-  `host.docker.internal`, with the bridge still restricted to an intentional
-  interface; and
-- transport code, start/plist configuration, tests, and this runbook are
-  updated together, retaining token protection and the no-LAN-exposure rule.
+1. Disable the iMCP plugin in Stavrobot and stop the active tmux or LaunchAgent
+   supervisor using the procedure in **Rollback and uninstall** above. Preserve
+   the token, allowlist, and approved audit record unless they are separately
+   being revoked.
+2. Deploy the reviewed prior revision as a complete unit and install its pinned
+   dependencies in a clean virtual environment. Keep the bridge bind, port,
+   path, and auth settings at `127.0.0.1:8766/bridge`.
+3. Start that bridge and resolve any manual iMCP permission or client-approval
+   prompt. Run the host-side read-only `list_tools` check before re-enabling
+   the plugin; a listing retry is safe, but do not replay a `call_tool` with an
+   uncertain outcome.
+4. Re-enable the plugin only after the authenticated listing succeeds from
+   `plugin-runner`. Its `bridge_url` and HTTP request/response contract remain
+   unchanged across this transport rollback.
 
-Until those criteria are met, keep Bonjour discovery and forced loopback. Never
-respond to a failed container check by binding the bridge to `0.0.0.0` or by
-exposing the discovered internal port.
+When returning to stdio, stop the prior supervisor, deploy this revision with
+an iMCP app at least 1.8.2, reinstall this revision's dependencies, and repeat
+the executable, approval, reconnect, and plugin-runner checks. Never resolve a
+failed container check by binding the bridge to `0.0.0.0`.
